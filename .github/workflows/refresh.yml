@@ -1,0 +1,121 @@
+name: 币安跟单榜刷新
+
+on:
+  schedule:
+    # 每半小时一次，避开整点（GitHub 整点排队最严重）
+    - cron: '7,37 * * * *'
+  workflow_dispatch:
+    inputs:
+      probe_only:
+        description: '只探测出口 IP 能否访问币安，不抓数据'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: copytrade-refresh
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------
+  # 第一道闸：GitHub 托管 runner 的美国 Azure 出口 IP 常被币安 451 拦截。
+  # 先花 3 秒验证，别让 100 人的采集白跑 5 分钟再失败。
+  # 若被拦：在仓库 Secrets 里配置 BINANCE_PROXY（http://user:pass@host:port），
+  # 或把 runs-on 改成 self-hosted（见 README）。
+  # ---------------------------------------------------------------
+  probe:
+    runs-on: ubuntu-latest
+    outputs:
+      ok: ${{ steps.hit.outputs.ok }}
+    steps:
+      - name: 探测币安 bapi
+        id: hit
+        env:
+          HTTPS_PROXY: ${{ secrets.BINANCE_PROXY }}
+          HTTP_PROXY: ${{ secrets.BINANCE_PROXY }}
+        run: |
+          BODY='{"pageNumber":1,"pageSize":1,"timeRange":"30D","dataType":"COPY_COUNT","favoriteOnly":false,"hideFull":false,"nickname":"","order":"DESC","userAsset":0,"portfolioType":"ALL","useAiRecommended":false}'
+          CODE=$(curl -sS -o /tmp/probe.json -w '%{http_code}' --max-time 25 \
+            -X POST 'https://www.binance.com/bapi/futures/v1/friendly/future/copy-trade/home-page/query-list' \
+            -H 'Content-Type: application/json' \
+            -H 'clienttype: web' -H 'lang: zh-CN' \
+            -H 'Origin: https://www.binance.com' \
+            -H 'Referer: https://www.binance.com/zh-CN/copy-trading' \
+            -H 'Accept: application/json' \
+            -H 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' \
+            --data "$BODY" || echo 000)
+          echo "HTTP=$CODE"
+          head -c 400 /tmp/probe.json 2>/dev/null; echo
+          if [ "$CODE" = "200" ] && grep -q '"data"' /tmp/probe.json; then
+            echo "ok=1" >> "$GITHUB_OUTPUT"
+            echo "币安接口可达，可以继续采集。"
+          else
+            echo "ok=0" >> "$GITHUB_OUTPUT"
+            echo "::error::币安接口不可达（HTTP $CODE）。GitHub 托管 runner 的出口 IP 通常被 451 拦截；请配置 BINANCE_PROXY secret 或改用 self-hosted runner。"
+            exit 1
+          fi
+
+  refresh:
+    needs: probe
+    if: ${{ inputs.probe_only != true && needs.probe.outputs.ok == '1' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # urllib 会自动读取 HTTPS_PROXY / HTTP_PROXY，脚本无需改动。
+      # state 文件由仓库持久化，因此每轮都是「增量推送」而非重建基线。
+      - name: 采集一轮（100 人 + 平仓 + 订单）
+        env:
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          PUSH_WEBHOOK: ${{ secrets.PUSH_WEBHOOK }}
+          HTTPS_PROXY: ${{ secrets.BINANCE_PROXY }}
+          HTTP_PROXY: ${{ secrets.BINANCE_PROXY }}
+        run: |
+          python3 trader_alert.py --once \
+            --top 100 --sort COPY_COUNT --tab all \
+            --hist-size 20 --order-size 20
+          echo "runner-ip: $(curl -sS --max-time 10 https://api.ipify.org || echo unknown)"
+
+      - name: 生成自包含静态站
+        run: python3 build_static.py
+
+      # [skip ci] 避免自动 commit 再次触发 workflow；自动 commit 也顺带
+      # 满足「public 仓库 60 天无活动会停掉 schedule」的保活要求。
+      - name: 回写状态与快照
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f trader_alert_state.json monitor-data.json
+          if git diff --cached --quiet; then
+            echo "数据无变化，跳过提交。"
+          else
+            git commit -m "chore: refresh $(date -u +'%Y-%m-%d %H:%M UTC') [skip ci]"
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+            git push
+          fi
+
+      - name: 配置 Pages
+        continue-on-error: true
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: 上传静态站
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+      - name: 发布 Pages
+        continue-on-error: true
+        uses: actions/deploy-pages@v4

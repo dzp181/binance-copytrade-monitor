@@ -1,0 +1,12 @@
+# 白名单：仓库只保留运行所需的最小集合，中间产物/截图/大快照一律不入库
+*
+!.gitignore
+!README.md
+!trader_alert.py
+!monitor.html
+!monitor-data.json
+!trader_alert_state.json
+!build_static.py
+!.github/
+!.github/workflows/
+!.github/workflows/refresh.yml
