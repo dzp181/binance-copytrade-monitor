@@ -20,26 +20,37 @@ python3 trader_alert.py --web --watch 900         # 起网页 + 每 15 分钟刷
 `.github/workflows/refresh.yml` 每半小时（`7,37 * * * *` UTC）跑一轮，产出快照、
 推送增量事件、回写 state，并部署 GitHub Pages。
 
-**先跑一次探测**，别直接开定时：
+线上地址：https://dzp181.github.io/binance-copytrade-monitor/
+
+需要先在 Settings → Pages 把 Build and deployment 的 Source 设为 **GitHub Actions**
+（GITHUB_TOKEN 无权自动创建 Pages site，只能手动开一次）。
+
+想只验证出口而不抓数据：
 
 ```
 Actions -> 币安跟单榜刷新 -> Run workflow -> probe_only = true
 ```
 
-### 关键限制：451
+### 关于 451：实测结论
 
-GitHub 托管 runner 的出口是美国 Azure IP，币安会返回
-`451 Service unavailable from a restricted location`。workflow 因此把「探测」拆成
-第一个 job，3 秒失败，不让 100 人的采集白跑。三种解法：
+网上常见的结论是「GitHub 托管 runner 是美国 Azure IP，币安一律 451」，
+但那主要针对 `fapi.binance.com` / `api.binance.com` 这类交易 API。
+**2026-11-09 实测**：Azure westus3 出口（`4.249.19.21`）请求跟单榜的
+`www.binance.com/bapi/.../home-page/query-list` 返回 `HTTP 200`、
+`code=000000`、`total=12980`；完整一轮 100 人（含 1586 条平仓、1707 条订单）
+约 14 秒采完，比本机还快。所以**默认托管 runner 可用，不需要代理**。
+
+workflow 仍保留 `probe` job 作为保险：哪天币安收紧策略或触发限流，
+3 秒内失败，不让 100 人采集白跑。届时三种备用方案：
 
 | 方案 | 做法 | 代价 |
 | --- | --- | --- |
-| 代理出口（推荐） | 仓库 Secrets 加 `BINANCE_PROXY=http://user:pass@host:port` | 需要一个非受限地区的 HTTP 代理；`urllib` 会自动读取 `HTTPS_PROXY`，脚本零改动 |
+| 代理出口（首选） | 仓库 Secrets 加 `BINANCE_PROXY=http://user:pass@host:port` | 需要一个非受限地区的 HTTP 代理；`urllib` 会自动读取 `HTTPS_PROXY`，脚本零改动 |
 | 自建 runner | 把两个 job 的 `runs-on` 改成 `self-hosted`，跑在非美区 VPS 或本机 | 要维护一台常开的机器 |
-| 不用 Actions | 本机 `launchd` 定时跑 `--once`，只把 `docs/` 推到 Pages | 电脑要常开，但没有 451 问题 |
+| 不用 Actions | 本机 `launchd` 定时跑 `--once`，只把 `docs/` 推到 Pages | 电脑要常开，但没有出口限制问题 |
 
 `BINANCE_PROXY` 必须是 HTTP/HTTPS 代理（SOCKS5 原生 `urllib` 不支持）。
-配好后重跑 `probe_only=true`，看到 `HTTP=200` 即可关掉探测开关正常跑。
+配好后重跑 `probe_only=true`，看到 `HTTP=200` 即恢复正常。
 
 ### Secrets（按需，全部可选）
 

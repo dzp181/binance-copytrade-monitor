@@ -22,10 +22,10 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------
-  # 第一道闸：GitHub 托管 runner 的美国 Azure 出口 IP 常被币安 451 拦截。
-  # 先花 3 秒验证，别让 100 人的采集白跑 5 分钟再失败。
-  # 若被拦：在仓库 Secrets 里配置 BINANCE_PROXY（http://user:pass@host:port），
-  # 或把 runs-on 改成 self-hosted（见 README）。
+  # 第一道闸：2026-11-09 实测 Azure westus3 出口请求该 bapi 端点返回 200，
+  # 100 人一轮约 14 秒。但币安对数据中心 IP 的策略会变，仍先花 3 秒验证，
+  # 避免策略收紧 / 限流时整轮白跑。
+  # 若某天返回 451 / 429：配 BINANCE_PROXY secret，或把 runs-on 改 self-hosted。
   # ---------------------------------------------------------------
   probe:
     runs-on: ubuntu-latest
