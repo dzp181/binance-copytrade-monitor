@@ -1,0 +1,67 @@
+name: 每日维护（搜索索引 + 数据库备份）
+
+# 搜索索引：网页没有后端出网能力，搜索靠这份预生成的昵称表，所以每天重建一次。
+# 数据库备份：应用沙箱里的 data.db 是唯一数据源，每天拉一份回仓库，
+# 万一应用被删/沙箱重建，名单和用户还能从这里恢复。
+
+on:
+  schedule:
+    - cron: '17 3 * * *'    # 索引：每天 03:17 UTC = 11:17 北京
+    - cron: '7 4 * * *'     # 备份：每天 04:07 UTC = 12:07 北京
+  workflow_dispatch:
+    inputs:
+      job:
+        description: '跑哪个'
+        type: choice
+        options: [both, index, backup]
+        default: both
+
+permissions:
+  contents: write
+
+concurrency:
+  group: copytrade-daily
+  cancel-in-progress: false
+
+env:
+  APP_URL: ${{ vars.APP_URL }}
+  APP_SHARE: ${{ vars.APP_SHARE }}
+  APP_TOKEN: ${{ secrets.APP_TOKEN }}
+
+jobs:
+  index:
+    if: ${{ github.event.schedule == '17 3 * * *' || inputs.job == 'both' || inputs.job == 'index' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HTTPS_PROXY: ${{ secrets.BINANCE_PROXY }}
+      HTTP_PROXY: ${{ secrets.BINANCE_PROXY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 重建全量索引并推到应用
+        run: python3 sync_app.py index
+
+  backup:
+    if: ${{ github.event.schedule == '7 4 * * *' || inputs.job == 'both' || inputs.job == 'backup' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: 拉数据库备份
+        run: |
+          python3 sync_app.py backup
+          ls -lh backups/ || true
+      - name: 提交备份
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f backups
+          if git diff --cached --quiet; then
+            echo "备份无变化，跳过提交。"
+          else
+            git commit -m "chore: backup $(date -u +'%Y-%m-%d') [skip ci]"
+            git push
+          fi

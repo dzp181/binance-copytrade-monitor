@@ -13,3 +13,7 @@
 !.github/
 !.github/workflows/
 !.github/workflows/refresh.yml
+!sync_app.py
+!.github/workflows/daily.yml
+!backups/
+!backups/**

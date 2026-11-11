@@ -1,5 +1,14 @@
 name: 币安跟单榜刷新
 
+# 分工：
+#   WorkBuddy 应用（https://binance-copytrade.app.workbuddy.host）
+#       用户、名单、审核、搜索索引、页面 —— 沙箱不能出网
+#   GitHub Actions（这里）
+#       能出网，负责采集币安、推 ntfy、回写快照 —— 名单从应用拉
+#
+# 每轮顺序固定：拉名单 -> 采集 -> 回写快照。应用永远是名单的唯一来源，
+# 所以别在这个文件里改名单，改网页。
+
 on:
   schedule:
     # 每半小时一次，避开整点（GitHub 整点排队最严重）
@@ -10,16 +19,6 @@ on:
         description: '只探测出口 IP 能否访问币安，不抓数据'
         type: boolean
         default: false
-      add_target:
-        description: '添加监控：带单员 ID 或主页链接（留空则不加）'
-        type: string
-        required: false
-        default: ''
-      remove_pid:
-        description: '移除监控：带单员 ID（留空则不移除）'
-        type: string
-        required: false
-        default: ''
       ntfy_test:
         description: '只发一条 ntfy 自检消息，验证 runner -> 服务器推送链路'
         type: boolean
@@ -27,20 +26,15 @@ on:
 
 permissions:
   contents: write
-  pages: write
-  id-token: write
 
 concurrency:
   group: copytrade-refresh
   cancel-in-progress: true
 
 jobs:
-  # ---------------------------------------------------------------
-  # 第一道闸：2026-11-09 实测 Azure westus3 出口请求该 bapi 端点返回 200，
-  # 100 人一轮约 14 秒。但币安对数据中心 IP 的策略会变，仍先花 3 秒验证，
-  # 避免策略收紧 / 限流时整轮白跑。
-  # 若某天返回 451 / 429：配 BINANCE_PROXY secret，或把 runs-on 改 self-hosted。
-  # ---------------------------------------------------------------
+  # 第一道闸：2026-11-09 实测 Azure 出口请求该 bapi 端点返回 200，
+  # 但币安对数据中心 IP 的策略会变，先花 3 秒验证，避免整轮白跑。
+  # 若某天 451 / 429：配 BINANCE_PROXY secret，或把 runs-on 改 self-hosted。
   probe:
     runs-on: ubuntu-latest
     outputs:
@@ -69,7 +63,7 @@ jobs:
             echo "币安接口可达，可以继续采集。"
           else
             echo "ok=0" >> "$GITHUB_OUTPUT"
-            echo "::error::币安接口不可达（HTTP $CODE）。GitHub 托管 runner 的出口 IP 通常被 451 拦截；请配置 BINANCE_PROXY secret 或改用 self-hosted runner。"
+            echo "::error::币安接口不可达（HTTP $CODE）。请配置 BINANCE_PROXY secret 或改用 self-hosted runner。"
             exit 1
           fi
 
@@ -78,6 +72,15 @@ jobs:
     if: ${{ inputs.probe_only != true && needs.probe.outputs.ok == '1' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      APP_URL: ${{ vars.APP_URL }}
+      APP_SHARE: ${{ vars.APP_SHARE }}
+      APP_TOKEN: ${{ secrets.APP_TOKEN }}
+      NTFY_URL: ${{ secrets.NTFY_URL }}
+      NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+      SITE_URL: ${{ vars.SITE_URL }}
+      HTTPS_PROXY: ${{ secrets.BINANCE_PROXY }}
+      HTTP_PROXY: ${{ secrets.BINANCE_PROXY }}
     steps:
       - uses: actions/checkout@v4
 
@@ -85,54 +88,30 @@ jobs:
         with:
           python-version: '3.11'
 
-      # urllib 会自动读取 HTTPS_PROXY / HTTP_PROXY，脚本无需改动。
-      # state 文件由仓库持久化，因此每轮都是「增量推送」而非重建基线。
-      # 名单同样由仓库持久化（watchlist.json），采集对象 = 名单里的 enabled 项。
-      - name: 名单变更（可选）
-        if: ${{ inputs.add_target != '' || inputs.remove_pid != '' }}
-        run: |
-          if [ -n "${{ inputs.add_target }}" ]; then
-            echo "添加：${{ inputs.add_target }}"
-            python3 trader_alert.py --add "${{ inputs.add_target }}"
-          fi
-          if [ -n "${{ inputs.remove_pid }}" ]; then
-            echo "移除：${{ inputs.remove_pid }}"
-            python3 trader_alert.py --remove "${{ inputs.remove_pid }}"
-          fi
-          python3 trader_alert.py --list
-
       - name: ntfy 链路自检
         if: ${{ inputs.ntfy_test == true }}
-        env:
-          NTFY_URL: ${{ secrets.NTFY_URL }}
-          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
         run: python3 trader_alert.py --test-ntfy --topic bn-36355328
 
+      # 名单唯一来源是应用，先拉下来覆盖仓库里的 watchlist.json，
+      # 否则会出现「网页上删了人，采集还在抓」的双源问题。
+      - name: 拉取名单
+        run: python3 sync_app.py pull
+
       - name: 采集一轮（名单内全部带单员 + 平仓 + 订单）
-        env:
-          NTFY_URL: ${{ secrets.NTFY_URL }}
-          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
-          SITE_URL: ${{ vars.SITE_URL }}
-          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          PUSH_WEBHOOK: ${{ secrets.PUSH_WEBHOOK }}
-          HTTPS_PROXY: ${{ secrets.BINANCE_PROXY }}
-          HTTP_PROXY: ${{ secrets.BINANCE_PROXY }}
         run: |
           python3 trader_alert.py --once --hist-size 20 --order-size 20
           echo "runner-ip: $(curl -sS --max-time 10 https://api.ipify.org || echo unknown)"
 
-      - name: 生成自包含静态站
-        run: python3 build_static.py
+      - name: 回写快照到应用
+        run: python3 sync_app.py push
 
       # [skip ci] 避免自动 commit 再次触发 workflow；自动 commit 也顺带
       # 满足「public 仓库 60 天无活动会停掉 schedule」的保活要求。
-      - name: 回写状态与快照
+      - name: 回写状态
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -f trader_alert_state.json monitor-data.json watchlist.json docs
+          git add -f trader_alert_state.json monitor-data.json watchlist.json
           if git diff --cached --quiet; then
             echo "数据无变化，跳过提交。"
           else
@@ -140,31 +119,3 @@ jobs:
             git pull --rebase origin "${GITHUB_REF_NAME}" || true
             git push
           fi
-
-      - name: 配置 Pages
-        continue-on-error: true
-        uses: actions/configure-pages@v5
-        with:
-          enablement: true
-
-      - name: 上传静态站
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: docs
-
-  # 部署单独一个 job：同 job 内上传完立刻部署会撞上产物列表的最终一致性，
-  # deploy-pages 报 "Found 0 artifact(s)"（2026-11-11 实测过）。
-  deploy:
-    needs: refresh
-    if: ${{ needs.refresh.result == 'success' }}
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    permissions:
-      pages: write
-      id-token: write
-    steps:
-      - name: 发布 Pages
-        id: deployment
-        uses: actions/deploy-pages@v4

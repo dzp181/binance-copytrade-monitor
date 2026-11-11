@@ -1,5 +1,5 @@
 {
- "updated_at": "2026-11-11 09:13:38",
+ "updated_at": "2026-11-11 10:43:45",
  "items": [
   {
    "pid": "4788776444236355328",
@@ -7,9 +7,9 @@
    "topic": "bn-36355328",
    "name": "星辰社区-意钦",
    "enabled": true,
-   "source": "manual",
+   "source": "app",
    "note": "",
-   "added_at": "2026-11-10 17:48",
+   "added_at": "2026-11-11 10:43",
    "last_trade_at": 1794322098674
   },
   {
@@ -18,9 +18,9 @@
    "topic": "bn-05208320",
    "name": "Btc星辰",
    "enabled": true,
-   "source": "manual",
+   "source": "app",
    "note": "",
-   "added_at": "2026-11-10 17:48",
+   "added_at": "2026-11-11 10:43",
    "last_trade_at": 1794182425485
   },
   {
@@ -29,10 +29,10 @@
    "topic": "bn-94326273",
    "name": "黑石策略",
    "enabled": true,
-   "source": "seed",
+   "source": "app",
    "note": "",
-   "added_at": "2026-11-10 17:52",
-   "last_trade_at": 1794358304608,
+   "added_at": "2026-11-11 10:43",
+   "last_trade_at": 1794361519507,
    "show": true
   },
   {
@@ -41,11 +41,9 @@
    "topic": "bn-07319296",
    "name": "Shock牙医",
    "enabled": true,
-   "source": "seed",
+   "source": "app",
    "note": "",
-   "added_at": "2026-11-10 17:52",
-   "last_trade_at": 1794301341891,
-   "show": false
+   "added_at": "2026-11-11 10:43"
   },
   {
    "pid": "4287847543651684864",
@@ -53,9 +51,9 @@
    "topic": "bn-51684864",
    "name": "星火研究院-大象",
    "enabled": true,
-   "source": "seed",
+   "source": "app",
    "note": "",
-   "added_at": "2026-11-10 17:52",
+   "added_at": "2026-11-11 10:43",
    "last_trade_at": 1794325732603,
    "show": true
   },
@@ -65,11 +63,9 @@
    "topic": "bn-70629377",
    "name": "BTC杰师傅",
    "enabled": true,
-   "source": "seed",
+   "source": "app",
    "note": "",
-   "added_at": "2026-11-10 17:52",
-   "last_trade_at": 1794297698278,
-   "show": false
+   "added_at": "2026-11-11 10:43"
   },
   {
    "pid": "5217752912495035905",
@@ -77,10 +73,22 @@
    "topic": "bn-95035905",
    "name": "建斌论坛",
    "enabled": true,
-   "source": "seed",
+   "source": "app",
    "note": "",
-   "added_at": "2026-11-10 17:52",
-   "last_trade_at": 1794356196945,
+   "added_at": "2026-11-11 10:43",
+   "last_trade_at": 1794362091819,
+   "show": true
+  },
+  {
+   "pid": "5081524986903087872",
+   "slug": "bn-03087872",
+   "topic": "bn-03087872",
+   "name": "金融观察者",
+   "enabled": true,
+   "source": "app",
+   "note": "",
+   "added_at": "2026-11-11 10:43",
+   "last_trade_at": 1794336211524,
    "show": true
   }
  ]

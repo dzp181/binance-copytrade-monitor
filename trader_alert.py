@@ -323,6 +323,77 @@ def search_leaders(nickname, limit=20):
     return [_slim_leader(r) for r in rows][:limit]
 
 
+# ---------------------------------------------------------------- 搜索索引
+# 静态站没有后端，币安接口也没有 CORS 头，浏览器搜不了。
+# 于是把「全部」榜全量导出成一个紧凑索引，页面在用户第一次搜索时懒加载，
+# 之后本地过滤——不打扰任何人，也不用为一次搜索付一次网络往返。
+INDEX_FILE = os.path.join("docs", "leader-index.json")
+INDEX_PAGE_SIZE = 30
+
+
+def _index_page(page):
+    body = {
+        "pageNumber": page, "pageSize": INDEX_PAGE_SIZE,
+        "timeRange": "30D", "dataType": "COPY_COUNT",
+        "favoriteOnly": False, "hideFull": False, "nickname": "",
+        "order": "DESC", "userAsset": 0, "portfolioType": "ALL",
+        "useAiRecommended": False,
+    }
+    doc = request(LIST_PATH, "POST", body=body)
+    data = doc.get("data") or {}
+    return data.get("total") or 0, data.get("list") or []
+
+
+def build_index(pages=0, workers=4):
+    """拉全量「全部」榜，写 docs/leader-index.json。
+
+    只保留 pid / 昵称 / 跟单人数。头像是八十多字符的 URL，全量存进来会
+    让索引从 700KB 涨到 2MB+，移动端首屏不该为搜索付这个代价——点开某人
+    时再走详情接口取头像。
+    """
+    total, first = _index_page(1)
+    if not total or not first:
+        raise RuntimeError("榜单第一页没有数据，可能被限流，稍后重试")
+    page_count = pages or (total + INDEX_PAGE_SIZE - 1) // INDEX_PAGE_SIZE
+    rows = {}
+
+    def take(batch):
+        for r in batch:
+            pid = str(r.get("leadPortfolioId") or "")
+            if pid and pid not in rows:
+                rows[pid] = [pid, r.get("nickname") or "",
+                             int(r.get("currentCopyCount") or 0)]
+
+    take(first)
+    print("榜单 total=%d，共 %d 页，开始并发拉取（%d 并发）…" % (total, page_count, workers))
+    failed = 0
+    if page_count > 1:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = {pool.submit(_index_page, p): p for p in range(2, page_count + 1)}
+            done = 0
+            for fut in as_completed(futs):
+                done += 1
+                try:
+                    _, batch = fut.result()
+                    take(batch)
+                except Exception as exc:
+                    failed += 1
+                    print("  第 %d 页失败：%s" % (futs[fut], exc))
+                if done % 50 == 0:
+                    print("  %d/%d 页，去重后 %d 人" % (done, page_count - 1, len(rows)))
+
+    items = sorted(rows.values(), key=lambda x: -x[2])
+    os.makedirs(os.path.dirname(INDEX_FILE), exist_ok=True)
+    payload = {"updated_at": stamp("%Y-%m-%d %H:%M:%S"),
+               "total": len(items), "pages": page_count, "rows": items}
+    with open(INDEX_FILE, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+    size = os.path.getsize(INDEX_FILE)
+    print("索引已生成：%d 人，%d 页失败，%.0f KB -> %s" % (
+        len(items), failed, size / 1024.0, INDEX_FILE))
+    return payload
+
+
 # ---------------------------------------------------------------- 抓取
 def fetch_history(pid, size=50):
     doc = request(HISTORY_PATH, "POST", body={
@@ -558,6 +629,106 @@ def push_legacy(text):
         except Exception as exc:
             sent.append("自定义失败: %s" % exc)
     return sent
+
+
+# ---------------------------------------------------------------- 提交队列
+# 网页是静态站（GitHub Pages，https），既连不上币安也没有后端。
+# 所以「用户想监控谁」不写进网页，而是写进服务器上 ntfy 的一个可匿名写入的
+# 主题；Actions 每轮带 token 拉一次，校验通过才并入名单。
+# 服务器因此只需要跑 ntfy：收提交、发推送，不碰币安。
+QUEUE_TOPIC = os.environ.get("QUEUE_TOPIC") or "bnsubmit"
+QUEUE_SEEN_FILE = "queue_seen.json"
+QUEUE_MAX_PER_ROUND = int(os.environ.get("QUEUE_MAX_PER_ROUND") or 10)
+QUEUE_SEEN_KEEP = 500
+
+
+def load_queue_seen():
+    try:
+        with open(QUEUE_SEEN_FILE, encoding="utf-8") as f:
+            doc = json.load(f)
+        return {"ids": [str(x) for x in (doc.get("ids") or [])][-QUEUE_SEEN_KEEP:]}
+    except Exception:
+        return {"ids": []}
+
+
+def save_queue_seen(doc):
+    with open(QUEUE_SEEN_FILE, "w", encoding="utf-8") as f:
+        json.dump({"ids": doc["ids"][-QUEUE_SEEN_KEEP:]}, f,
+                  ensure_ascii=False, separators=(",", ":"))
+
+
+def fetch_queue():
+    """从 ntfy 的 poll 接口拉队列消息。匿名读不到，必须带 token。"""
+    if not NTFY_TOKEN:
+        print("  ! 未配置 NTFY_TOKEN，跳过提交队列")
+        return []
+    url = "%s/%s/json?poll=1&since=all" % (NTFY_URL, QUEUE_TOPIC)
+    req = urllib.request.Request(url, headers={
+        "Authorization": "Bearer " + NTFY_TOKEN, "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            raw = r.read().decode("utf-8", "ignore")
+    except Exception as exc:
+        print("  ! 读取提交队列失败：%s" % exc)
+        return []
+    msgs = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            m = json.loads(line)
+        except Exception:
+            continue
+        if m.get("event") == "message" and m.get("id"):
+            msgs.append(m)
+    return msgs
+
+
+def process_queue(limit=None):
+    """把队列里的提交并入名单，返回本轮真正新增的条目。
+
+    失败的语义要分清：格式/ID 无效（ValueError）标记为已处理，否则每轮都会
+    重试同一条垃圾；网络抖动不标记，留到下一轮。
+    """
+    limit = QUEUE_MAX_PER_ROUND if limit is None else limit
+    msgs = fetch_queue()
+    if not msgs:
+        return []
+    seen = load_queue_seen()
+    done = set(seen["ids"])
+    fresh = [m for m in msgs if m["id"] not in done]
+    if not fresh:
+        return []
+    print("提交队列：%d 条新消息" % len(fresh))
+    added = []
+    for m in sorted(fresh, key=lambda x: x.get("time") or 0):
+        mid = m["id"]
+        raw = str(m.get("message") or "").strip()[:200]
+        note = str(m.get("title") or "").strip()[:40]
+        if not raw:
+            seen["ids"].append(mid)
+            continue
+        if len(added) >= limit:
+            print("  达到单轮上限 %d，其余留到下一轮" % limit)
+            break
+        try:
+            entry = add_watch(raw, source="submit", note=note)
+        except ValueError as exc:
+            print("  跳过 %s：%s" % (raw[:40], exc))
+            seen["ids"].append(mid)
+            continue
+        except Exception as exc:
+            print("  %s 本轮失败，下轮重试：%s" % (raw[:40], exc))
+            continue
+        seen["ids"].append(mid)
+        if entry.get("_reused"):
+            print("  已在名单：%s" % entry.get("name"))
+        else:
+            added.append(entry)
+            print("  收下：%s  %s" % (entry.get("name"), entry.get("topic")))
+    save_queue_seen(seen)
+    return added
 
 
 # ---------------------------------------------------------------- 事件聚合
@@ -907,6 +1078,16 @@ def collect(hist_size=20, order_size=20, workers=4):
 
 
 def run_once(args):
+    # 提交队列已经迁到 WorkBuddy 应用（网页上提交、管理员审核），
+    # 这里默认不再读 ntfy 的 bnsubmit 主题，避免两条提交路径打架。
+    # 真要用回旧通道，设 SUBMIT_QUEUE=1。
+    if os.environ.get("SUBMIT_QUEUE") == "1" and not getattr(args, "no_queue", False):
+        try:
+            new_entries = process_queue()
+            if new_entries:
+                print("队列并入 %d 人，本轮一起采集。" % len(new_entries))
+        except Exception as exc:
+            print("  ! 处理提交队列出错（不影响采集）：%s" % exc, file=sys.stderr)
     entries = watch_entries()
     print("名单 %d 人，开始采集…" % len(entries))
     if not entries:
@@ -1183,6 +1364,12 @@ def main():
     ap.add_argument("--list", action="store_true", help="打印当前名单")
     ap.add_argument("--test-ntfy", action="store_true", help="发一条自检消息到 ntfy")
     ap.add_argument("--topic", help="配合 --test-ntfy 指定主题")
+    ap.add_argument("--pull-queue", action="store_true",
+                    help="只处理提交队列（网页提交的监控对象），不采集")
+    ap.add_argument("--no-queue", action="store_true",
+                    help="本轮不处理提交队列")
+    ap.add_argument("--rebuild-index", action="store_true",
+                    help="重建全量带单员索引（供网页本地搜索）")
     ap.add_argument("--limit", type=int, default=20, help="搜索结果条数")
     ap.add_argument("--hist-size", type=int, default=20, help="每人拉取平仓记录条数")
     ap.add_argument("--order-size", type=int, default=20,
@@ -1215,6 +1402,13 @@ def main():
         return
     if a.test_ntfy:
         cmd_test_ntfy(a.topic)
+        return
+    if a.pull_queue:
+        added = process_queue()
+        print("队列处理完毕，新增 %d 人。" % len(added))
+        return
+    if a.rebuild_index:
+        build_index()
         return
 
     if a.web:
