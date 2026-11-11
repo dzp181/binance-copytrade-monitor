@@ -1,5 +1,5 @@
 {
- "updated_at": "2026-11-11 10:47:08",
+ "updated_at": "2026-11-11 12:05:23",
  "items": [
   {
    "pid": "4788776444236355328",
@@ -9,7 +9,7 @@
    "enabled": true,
    "source": "app",
    "note": "",
-   "added_at": "2026-11-11 02:47",
+   "added_at": "2026-11-11 04:05",
    "last_trade_at": 1794322098674
   },
   {
@@ -20,8 +20,8 @@
    "enabled": true,
    "source": "app",
    "note": "",
-   "added_at": "2026-11-11 02:47",
-   "last_trade_at": 1794182425485
+   "added_at": "2026-11-11 04:05",
+   "last_trade_at": 1794368352907
   },
   {
    "pid": "5283137603594326273",
@@ -31,8 +31,8 @@
    "enabled": true,
    "source": "app",
    "note": "",
-   "added_at": "2026-11-11 02:47",
-   "last_trade_at": 1794361519507,
+   "added_at": "2026-11-11 04:05",
+   "last_trade_at": 1794369683986,
    "show": true
   },
   {
@@ -43,7 +43,7 @@
    "enabled": true,
    "source": "app",
    "note": "",
-   "added_at": "2026-11-11 02:47"
+   "added_at": "2026-11-11 04:05"
   },
   {
    "pid": "4287847543651684864",
@@ -53,7 +53,7 @@
    "enabled": true,
    "source": "app",
    "note": "",
-   "added_at": "2026-11-11 02:47",
+   "added_at": "2026-11-11 04:05",
    "last_trade_at": 1794325732603,
    "show": true
   },
@@ -65,7 +65,7 @@
    "enabled": true,
    "source": "app",
    "note": "",
-   "added_at": "2026-11-11 02:47"
+   "added_at": "2026-11-11 04:05"
   },
   {
    "pid": "5217752912495035905",
@@ -75,8 +75,8 @@
    "enabled": true,
    "source": "app",
    "note": "",
-   "added_at": "2026-11-11 02:47",
-   "last_trade_at": 1794362091819,
+   "added_at": "2026-11-11 04:05",
+   "last_trade_at": 1794367470263,
    "show": true
   },
   {
@@ -87,9 +87,20 @@
    "enabled": true,
    "source": "app",
    "note": "",
-   "added_at": "2026-11-11 02:47",
+   "added_at": "2026-11-11 04:05",
    "last_trade_at": 1794336211524,
    "show": true
+  },
+  {
+   "pid": "5075281354358777856",
+   "slug": "bn-58777856",
+   "topic": "bn-58777856",
+   "name": "熬鹰资本",
+   "enabled": true,
+   "source": "app",
+   "note": "",
+   "added_at": "2026-11-11 04:05",
+   "last_trade_at": 1794322973243
   }
  ]
 }
