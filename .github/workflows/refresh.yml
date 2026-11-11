@@ -141,6 +141,19 @@ jobs:
         with:
           path: docs
 
+  # 部署单独一个 job：同 job 内上传完立刻部署会撞上产物列表的最终一致性，
+  # deploy-pages 报 "Found 0 artifact(s)"（2026-11-11 实测过）。
+  deploy:
+    needs: refresh
+    if: ${{ needs.refresh.result == 'success' }}
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    steps:
       - name: 发布 Pages
-        continue-on-error: true
+        id: deployment
         uses: actions/deploy-pages@v4
