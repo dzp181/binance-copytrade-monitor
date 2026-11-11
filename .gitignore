@@ -6,7 +6,10 @@
 !monitor.html
 !monitor-data.json
 !trader_alert_state.json
+!watchlist.json
 !build_static.py
+!docs/
+!docs/**
 !.github/
 !.github/workflows/
 !.github/workflows/refresh.yml

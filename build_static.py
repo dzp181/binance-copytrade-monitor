@@ -2,9 +2,10 @@
 """把本地监控台打包成完全自包含的静态站（供 GitHub Pages 使用）。
 
 不修改 monitor.html 源文件：所有路径改写只发生在生成出来的 docs/index.html。
-  /api/data            -> ./monitor-data.json
-  /api/trader?pid=xxx  -> ./trader/<pid>.json
-内联的 var DATA 同步替换为最新快照，保证断网/首屏也有数据。
+  var DATA = {...}      -> 替换为最新快照
+  /api/data             -> ./monitor-data.json
+  /api/trader?pid=xxx   -> ./trader/<pid>.json
+  var ADMIN = true      -> false（线上没有后端，隐藏写操作、搜索改为说明）
 
 用法：python3 build_static.py
 """
@@ -46,16 +47,19 @@ def main():
         "fetch('./trader/' + encodeURIComponent(pid) + '.json')",
         html,
     )
-    if n1 != 1 or n2 != 1:
-        raise SystemExit("路径改写失败：api/data=%d, api/trader=%d" % (n1, n2))
+    html, n3 = re.subn(r"var ADMIN = true;", "var ADMIN = false;", html)
+    if n1 != 1 or n2 != 1 or n3 != 1:
+        raise SystemExit("路径改写失败：api/data=%d, api/trader=%d, ADMIN=%d" % (n1, n2, n3))
 
     # 3) 每个带单员一份详情 JSON，结构与 /api/trader 返回值一致
     trader_dir = os.path.join(OUT, "trader")
     os.makedirs(trader_dir, exist_ok=True)
+    keep = set()
     for r in data.get("leaders", []):
         pid = str(r["pid"])
         if not pid.isdigit():
             continue
+        keep.add(pid + ".json")
         detail = {
             "pid": pid,
             "updated_at": data.get("updated_at"),
@@ -68,14 +72,21 @@ def main():
         with open(os.path.join(trader_dir, pid + ".json"), "w", encoding="utf-8") as f:
             f.write(compact(detail))
 
+    # 4) 名单变小后，清掉上一版留下的人（否则会一直挂在线上）
+    removed = 0
+    for name in os.listdir(trader_dir):
+        if name.endswith(".json") and name not in keep:
+            os.remove(os.path.join(trader_dir, name))
+            removed += 1
+
     os.makedirs(OUT, exist_ok=True)
     with open(os.path.join(OUT, "index.html"), "w", encoding="utf-8") as f:
         f.write(html)
     with open(os.path.join(OUT, DATA_FILE), "w", encoding="utf-8") as f:
         f.write(compact(data))
 
-    print("已生成 docs/index.html，%d 个带单员，快照时间 %s"
-          % (len(data.get("leaders", [])), data.get("updated_at")))
+    print("已生成 docs/index.html，%d 个带单员，快照时间 %s，清理旧详情 %d 份"
+          % (len(data.get("leaders", [])), data.get("updated_at"), removed))
 
 
 if __name__ == "__main__":

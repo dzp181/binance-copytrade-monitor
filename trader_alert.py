@@ -1,41 +1,49 @@
 #!/usr/bin/env python3
 """
-币安「跟单」榜牛人交易监控 + 推送。
+币安跟单带单员监控台 —— 自选名单 + 一人一订阅主题 + ntfy 推送。
 
-监控对象：App 跟单页「全部」tab（16:20 实测确认）。
-  「推薦 / 全部」由请求体 useAiRecommended 控制：
-    True  -> 推薦，total=170，前三 熬鹰资本/玺九爺HBJX/Bran Brandon
-    False -> 全部，total=12,975（本脚本默认，显式传参避免服务端改默认值）
-  当前网页口径：全部 tab + 30D + dataType=COPY_COUNT + hideFull=False，
-  只取前 100 人，按跟单人数降序。网页内嵌快照，断网可看；
-  点击带单员 -> /api/trader 按需拉取最近平仓与当前仓位。
+和上一版的区别（重要）：
+  上一版每轮去抓「跟单榜前 100 人」，名单由榜单算法决定。
+  这一版名单来自 watchlist.json，只监控你加进来的人：
+    - 搜索昵称找到人 -> 加进名单 -> 自动生成专属主题 bn-xxxxxxxx
+    - 每轮只采集名单里的人，谁进谁出与榜单排序无关
+    - 每人的平仓/持仓变化聚合后推到自己的 ntfy 主题
 
-能推什么：
-  1. 新平仓记录（所有人都有，带真实开/平仓时间、盈亏、杠杆）—— 主力
-  2. 可见持仓的变化（仅 positionShow=true 的人，实测头部 3/12 可见）—— 补充
-  3. 榜单指标变化（排名、跟单人数、30 日盈亏、AUM）—— 慢速播报
-
-不能推：成交逐笔、下单时刻、隐藏者的当前仓位、秒级实时。
-平仓历史有延迟（实测数分钟到约 1 小时不等），所以这是「播报」不是「跟单信号」。
+数据口径（2026-11 实测）：
+  detail 接口没有 30 日 ROI/PNL，只有 lifetime 指标。所以：
+    跟单人数   currentCopyCount / maxCopyCount
+    跟单者盈亏 copierPnl（跟单者视角的累计盈亏，比带单员自身 ROI 更贴近用户）
+    夏普       sharpRatio
+    最近交易   lastTradeTime（判断这人还在不在交易，比"最近 N 笔"更有用）
+  仓位/平仓/订单仍然有数分钟延迟，这是播报不是信号。
 
 用法：
-  python3 trader_alert.py --web                 # 网页监控台（默认口径，推荐）
-  python3 trader_alert.py --once                # 只抓一轮：建基线或推送新增事件
-  python3 trader_alert.py --preview             # 生成一条真实数据示例消息
-  python3 trader_alert.py --web --watch 900     # 网页 + 每 15 分钟刷新/推送
-  可覆盖：--top N / --sort PNL / --tab recommended / --hist-size 50
+  python3 trader_alert.py --search 星辰          # 昵称模糊搜索
+  python3 trader_alert.py --add 4788776444236355328
+  python3 trader_alert.py --add https://www.binance.com/zh-CN/copy-trading/lead-details/4788776444236355328
+  python3 trader_alert.py --list                 # 看当前名单与主题
+  python3 trader_alert.py --remove 4788776444236355328
+  python3 trader_alert.py --once                 # 采一轮（建基线或推送新增）
+  python3 trader_alert.py --preview              # 打印将要推送的内容，不发送
+  python3 trader_alert.py --test-ntfy            # 发一条自检到 ntfy
+  python3 trader_alert.py --web --watch 900      # 网页监控台 + 定时刷新
 
-推送渠道（环境变量，任一即可；都不设则打印到终端并写入 alerts.log）：
-  WECOM_WEBHOOK     企业微信群机器人完整 URL
-  TG_BOT_TOKEN + TG_CHAT_ID   Telegram
-  PUSH_WEBHOOK       自定义 webhook，POST {"text": "..."}
+推送配置（环境变量）：
+  NTFY_URL    自建 ntfy 地址，默认 http://112.74.95.74:8858
+  NTFY_TOKEN  ntfy 访问令牌；该服务是 deny-all，不带 token 会 403
+  SITE_URL    通知里"点击查看"跳转的网页地址
+
+兼容保留的全局渠道（可不配）：
+  WECOM_WEBHOOK / TG_BOT_TOKEN+TG_CHAT_ID / PUSH_WEBHOOK
 """
 import argparse
 import json
 import os
+import re
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timezone, timedelta
@@ -63,11 +71,19 @@ HEADERS = {
 
 CST = timezone(timedelta(hours=8))
 STATE_FILE = "trader_alert_state.json"
+WATCHLIST_FILE = "watchlist.json"
 LOG_FILE = "alerts.log"
 WEB_DATA_FILE = "monitor-data.json"
 WEB_PAGE_FILE = "monitor.html"
 
+NTFY_URL = (os.environ.get("NTFY_URL") or "http://112.74.95.74:8858").rstrip("/")
+NTFY_TOKEN = os.environ.get("NTFY_TOKEN") or ""
+SITE_URL = (os.environ.get("SITE_URL")
+            or "https://dzp181.github.io/binance-copytrade-monitor/")
+TOPIC_PREFIX = "bn-"
 
+
+# ---------------------------------------------------------------- 基础工具
 def now_cst():
     return datetime.now(CST)
 
@@ -100,9 +116,9 @@ def price(v):
 
 
 def pct(v):
-    """roi 字段是小数，0.1852 -> +18.5%"""
+    """入参是百分数（19.6 -> +19.6%），与 detail 的 roi 口径一致。"""
     try:
-        return ("+" if float(v) >= 0 else "") + "%.1f%%" % (float(v) * 100)
+        return ("+" if float(v) >= 0 else "") + "%.1f%%" % float(v)
     except (TypeError, ValueError):
         return "—"
 
@@ -123,30 +139,191 @@ def request(path, method="GET", body=None, params=None, retries=2):
     raise last
 
 
-def fetch_leaderboard(top=12, data_type="PNL", tab="all"):
-    """App「全部」tab：useAiRecommended=False；支持翻页（pageSize 上限 30）。"""
-    body = {
-        "pageNumber": 1, "pageSize": 30, "timeRange": "30D",
-        "dataType": data_type, "favoriteOnly": False, "hideFull": False,
-        "nickname": "", "order": "DESC", "userAsset": 0, "portfolioType": "ALL",
-        "useAiRecommended": (tab == "recommended"),
+# ---------------------------------------------------------------- 名单
+def slug_for(pid):
+    """一个带单员一个主题。用 pid 后 8 位：稳定、不撞名、改昵称不换主题。
+
+    不用昵称转拼音的原因是：中文昵称要额外依赖、会撞名、改名就换主题，
+    老订阅者直接收不到消息。
+    """
+    return TOPIC_PREFIX + str(pid)[-8:]
+
+
+def load_watchlist():
+    if not os.path.exists(WATCHLIST_FILE):
+        return {"updated_at": None, "items": []}
+    try:
+        with open(WATCHLIST_FILE, encoding="utf-8") as f:
+            doc = json.load(f)
+        if not isinstance(doc.get("items"), list):
+            doc["items"] = []
+        return doc
+    except Exception as exc:
+        print("! watchlist.json 读取失败：%s" % exc, file=sys.stderr)
+        return {"updated_at": None, "items": []}
+
+
+def save_watchlist(doc):
+    doc["updated_at"] = stamp("%Y-%m-%d %H:%M:%S")
+    tmp = WATCHLIST_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(doc, f, ensure_ascii=False, indent=1)
+        f.write("\n")
+    os.replace(tmp, WATCHLIST_FILE)
+
+
+def watch_entries(enabled_only=True):
+    """名单里的人，按加入顺序。slug/topic 缺失时按 pid 补出来。"""
+    out = []
+    for it in load_watchlist()["items"]:
+        pid = str(it.get("pid") or "")
+        if not pid.isdigit():
+            continue
+        if enabled_only and not it.get("enabled", True):
+            continue
+        it = dict(it)
+        it["pid"] = pid
+        it["slug"] = it.get("slug") or slug_for(pid)
+        it["topic"] = it.get("topic") or it["slug"]
+        out.append(it)
+    return out
+
+
+def find_entry(pid):
+    pid = str(pid)
+    for it in load_watchlist()["items"]:
+        if str(it.get("pid")) == pid:
+            return it
+    return None
+
+
+def add_watch(target, source="manual", note=""):
+    """按 pid 或主页链接加入名单。已在名单里则返回原条目（幂等）。"""
+    info = resolve_target(target)
+    pid = info["pid"]
+    doc = load_watchlist()
+    for it in doc["items"]:
+        if str(it.get("pid")) == pid:
+            if not it.get("enabled", True):
+                it["enabled"] = True
+                save_watchlist(doc)
+                return dict(it, _reused=True, _reenabled=True)
+            return dict(it, _reused=True)
+    entry = {
+        "pid": pid,
+        "slug": slug_for(pid),
+        "topic": slug_for(pid),
+        "name": info.get("name") or pid,
+        "show": bool(info.get("show")),
+        "enabled": True,
+        "source": source,
+        "note": note,
+        "added_at": stamp("%Y-%m-%d %H:%M"),
     }
-    rows, seen = [], set()
-    for page in range(1, (top + 29) // 30 + 1):
-        body["pageNumber"] = page
-        doc = request(LIST_PATH, "POST", body=body)
-        batch = (doc.get("data") or {}).get("list") or []
-        for r in batch:
-            pid = str(r.get("leadPortfolioId") or "")
-            if pid and pid not in seen:
-                seen.add(pid)
-                rows.append(r)
-        if len(batch) < 30 or len(rows) >= top:
-            break
-        time.sleep(0.2)
-    return rows[:top]
+    doc["items"].append(entry)
+    save_watchlist(doc)
+    return entry
 
 
+def remove_watch(pid):
+    pid = str(pid)
+    doc = load_watchlist()
+    before = len(doc["items"])
+    doc["items"] = [it for it in doc["items"] if str(it.get("pid")) != pid]
+    if len(doc["items"]) == before:
+        return False
+    save_watchlist(doc)
+    return True
+
+
+def touch_watch_meta(meta):
+    """用最新 detail 刷新名单里的昵称等元信息，只有真变了才写盘。"""
+    doc = load_watchlist()
+    changed = False
+    for it in doc["items"]:
+        pid = str(it.get("pid"))
+        m = meta.get(pid)
+        if not m:
+            continue
+        if m.get("name") and m["name"] != it.get("name"):
+            it["name"] = m["name"]
+            changed = True
+        if m.get("last_trade_at") and m["last_trade_at"] != it.get("last_trade_at"):
+            it["last_trade_at"] = m["last_trade_at"]
+            changed = True
+        if "show" in m and bool(m["show"]) != bool(it.get("show")):
+            it["show"] = bool(m["show"])
+            changed = True
+    if changed:
+        save_watchlist(doc)
+    return changed
+
+
+# ---------------------------------------------------------------- 搜索与解析
+PID_IN_URL = re.compile(r"(\d{15,20})")
+
+
+def resolve_target(text):
+    """从主页链接 / 裸 pid 反查带单员。搜索接口不支持按 pid 搜，只能走 detail。"""
+    text = str(text or "").strip()
+    if not text:
+        raise ValueError("没有提供 pid 或链接")
+    m = PID_IN_URL.search(text)
+    if not m:
+        raise ValueError("链接里找不到带单员 ID")
+    pid = m.group(1)
+    data = fetch_detail(pid)
+    if not data.get("leadPortfolioId"):
+        raise ValueError("查不到这个带单员（ID %s）" % pid)
+    return {
+        "pid": str(data.get("leadPortfolioId")),
+        "name": data.get("nickname") or pid,
+        "avatar": data.get("avatarUrl") or "",
+        "cc": data.get("currentCopyCount") or 0,
+        "max_cc": data.get("maxCopyCount") or 0,
+        "copier_pnl": data.get("copierPnl"),
+        "show": data.get("positionShow") is True,
+        "status": data.get("status") or "",
+        "paused": data.get("isPaused") is True,
+    }
+
+
+def _slim_leader(r):
+    return {
+        "pid": str(r.get("leadPortfolioId") or ""),
+        "name": r.get("nickname") or "",
+        "avatar": r.get("avatarUrl") or "",
+        "cc": r.get("currentCopyCount") or 0,
+        "max_cc": r.get("maxCopyCount") or 0,
+        "roi": r.get("roi"),
+        "pnl": r.get("pnl"),
+        "copier_pnl": r.get("copierPnl"),
+        "mdd": r.get("mdd"),
+        "show": (r.get("portfolioType") or "").upper() == "PUBLIC",
+        "badge": r.get("badgeName") or "",
+    }
+
+def search_leaders(nickname, limit=20):
+    """昵称模糊搜索。
+
+    两个必须注意的点（实测）：
+      1. 必须走 useAiRecommended=False（「全部」tab）。推荐 tab 只返回十几个人，
+         搜同一个词会漏掉大部分人。
+      2. 不支持按 pid 搜，19 位数字返回 0 条 -> 粘链接走 resolve_target。
+    """
+    body = {
+        "pageNumber": 1, "pageSize": min(30, max(10, limit)),
+        "timeRange": "30D", "dataType": "COPY_COUNT",
+        "favoriteOnly": False, "hideFull": False, "nickname": nickname,
+        "order": "DESC", "userAsset": 0, "portfolioType": "ALL",
+        "useAiRecommended": False,
+    }
+    doc = request(LIST_PATH, "POST", body=body)
+    rows = (doc.get("data") or {}).get("list") or []
+    return [_slim_leader(r) for r in rows][:limit]
+
+
+# ---------------------------------------------------------------- 抓取
 def fetch_history(pid, size=50):
     doc = request(HISTORY_PATH, "POST", body={
         "portfolioId": str(pid), "pageNumber": 1, "pageSize": size,
@@ -197,21 +374,7 @@ def fetch_positions(pid):
     return out
 
 
-def load_state():
-    if not os.path.exists(STATE_FILE):
-        return None
-    try:
-        with open(STATE_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-
-def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=1)
-
-
+# ---------------------------------------------------------------- 清洗
 def classify(a0, a1, eps=1e-8):
     if a0 == 0 and a1 != 0:
         return "开仓"
@@ -224,21 +387,6 @@ def classify(a0, a1, eps=1e-8):
     if abs(a1) < abs(a0) - eps:
         return "减仓"
     return None
-
-
-def cap_text(text, limit=3500):
-    """企业微信 markdown 消息上限 4096 字节，按行裁剪。"""
-    if len(text.encode("utf-8")) <= limit:
-        return text
-    out, used = [], 0
-    for line in text.split("\n"):
-        n = len((line + "\n").encode("utf-8"))
-        if used + n > limit - 40:
-            out.append("… 其余省略（消息过长已截断）")
-            break
-        out.append(line)
-        used += n
-    return "\n".join(out)
 
 
 def _clean_trades(hs):
@@ -318,33 +466,293 @@ def _clean_orders(rows):
     return out
 
 
-def build_web_data(leaders, histories, positions, visible, top,
-                   tab="all", sort="COPY_COUNT", orders=None):
-    """网页数据源：100 人目录 + 每人最近平仓 / 当前仓位，与推送共用原始响应。"""
-    out = []
-    for i, r in enumerate(leaders, 1):
-        pid = str(r.get("leadPortfolioId"))
-        trades = _clean_trades(histories.get(pid, []))
-        show = pid in positions and positions[pid] is not None
-        out.append({
-            "rank": i, "pid": pid, "name": r.get("nickname") or pid,
-            "cc": r.get("currentCopyCount") or 0,
-            "pnl": round(float(r.get("pnl") or 0), 2),
-            "roi": round(float(r.get("roi") or 0), 2),
-            "show": show,
-            "pos": _clean_positions(positions.get(pid)) if show else [],
-            "recent": trades[:20],
-            "orders": _clean_orders((orders or {}).get(pid, {}).get("rows"))[:WEB_ORDER_LIMIT],
-            "orders_total": (orders or {}).get(pid, {}).get("total", 0),
-            "trades": len(trades),
-            "last": trades[0]["closed"] if trades else 0,
+# ---------------------------------------------------------------- 状态
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return None
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            doc = json.load(f)
+        if doc.get("version") != 2:
+            # 旧版 seen_positions 是 100 人混合的，无法归属到人，直接重建基线
+            print("· 旧版状态已废弃，本轮重建基线（不会推送历史记录）")
+            return None
+        doc.setdefault("seen", {})
+        doc.setdefault("positions", {})
+        return doc
+    except Exception:
+        return None
+
+
+def save_state(state):
+    state["version"] = 2
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, separators=(",", ":"))
+    os.replace(tmp, STATE_FILE)
+
+
+# ---------------------------------------------------------------- ntfy 推送
+def publish_ntfy(topic, title, message, click=None, tags=None, priority=None):
+    """推一条到指定主题。返回人话结果，失败不抛异常（不能因推送挂掉整轮）。"""
+    if not NTFY_TOKEN:
+        return "跳过（未配置 NTFY_TOKEN）"
+    body = {"topic": topic, "title": title, "message": message}
+    if click:
+        body["click"] = click
+    if tags:
+        body["tags"] = tags
+    if priority:
+        body["priority"] = priority
+    req = urllib.request.Request(
+        NTFY_URL + "/",
+        data=json.dumps(body, ensure_ascii=False).encode(),
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Bearer " + NTFY_TOKEN},
+        method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return "ntfy %s" % resp.status
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", "ignore")[:120]
+        except Exception:
+            pass
+        return "ntfy %s %s" % (exc.code, detail)
+    except Exception as exc:
+        return "ntfy 失败：%s" % exc
+
+
+def push_legacy(text):
+    """保留的全局渠道，用于把整轮汇总发到企微/Telegram。"""
+    wecom = os.environ.get("WECOM_WEBHOOK")
+    tg_token = os.environ.get("TG_BOT_TOKEN")
+    tg_chat = os.environ.get("TG_CHAT_ID")
+    generic = os.environ.get("PUSH_WEBHOOK")
+    sent = []
+    if wecom:
+        try:
+            body = json.dumps({"msgtype": "markdown", "markdown": {"content": text}}).encode()
+            req = urllib.request.Request(wecom, data=body,
+                                         headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                sent.append("企业微信 %s" % resp.status)
+        except Exception as exc:
+            sent.append("企业微信失败: %s" % exc)
+    if tg_token and tg_chat:
+        try:
+            url = "https://api.telegram.org/bot%s/sendMessage" % tg_token
+            body = urlencode({"chat_id": tg_chat, "text": text}).encode()
+            with urllib.request.urlopen(urllib.request.Request(url, data=body), timeout=15) as resp:
+                sent.append("Telegram %s" % resp.status)
+        except Exception as exc:
+            sent.append("Telegram 失败: %s" % exc)
+    if generic:
+        try:
+            body = json.dumps({"text": text}).encode()
+            req = urllib.request.Request(generic, data=body,
+                                         headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                sent.append("自定义 %s" % resp.status)
+        except Exception as exc:
+            sent.append("自定义失败: %s" % exc)
+    return sent
+
+
+# ---------------------------------------------------------------- 事件聚合
+def build_events(items, state, min_pnl=0.0, preview=False):
+    """把一轮采集结果按「人」聚合成通知。
+
+    为什么必须聚合：一个人一轮可能同时平掉 5 笔，逐笔推就是 5 条通知，
+    订阅者当天就会关掉推送。一个人一条，正文列前几条。
+
+    返回 (events, seen_all)：
+      events   [{pid,name,topic,title,message,click,priority,tags,stats}]
+      seen_all {pid: set(positionId)} 本轮看到的全部平仓 id，用于更新基线
+    """
+    prev_seen = state.get("seen", {}) if state else {}
+    prev_pos = state.get("positions", {}) if state else {}
+    events, seen_all = [], {}
+
+    for it in items:
+        pid = it["pid"]
+        name = it.get("name") or pid
+        old_ids = prev_seen.get(pid)
+        baseline_only = old_ids is None and not preview
+
+        trades = it.get("recent") or []
+        seen_all[pid] = {t["id"] for t in trades if t.get("id")}
+
+        if baseline_only:
+            continue                       # 新人首轮只建基线，不推历史
+
+        old = set(old_ids or [])
+        fresh, total = [], 0.0
+        for t in trades:
+            if not t.get("id") or t["id"] in old:
+                continue
+            if abs(float(t.get("pnl") or 0)) < min_pnl:
+                continue
+            fresh.append(t)
+            total += float(t.get("pnl") or 0)
+
+        pos_lines = []
+        curr = it.get("pos") if it.get("show") else None
+        if curr is not None and not baseline_only:
+            old_map = prev_pos.get(pid) or {}
+            if old_map:
+                for key in set(list(old_map.keys()) + list(curr.keys())):
+                    a0 = (old_map.get(key) or {}).get("amount", 0)
+                    a1 = (curr.get(key) or {}).get("amount", 0)
+                    kind = classify(a0, a1)
+                    if kind:
+                        pos_lines.append("%s %s：%s → %s" % (
+                            key.split("|")[0], kind, a0, a1))
+
+        if not fresh and not pos_lines:
+            continue
+
+        lines, head = [], []
+        if fresh:
+            head.append("%d 笔平仓 %s USDT" % (len(fresh), money(total)))
+            for t in fresh[:5]:
+                side_txt = "多" if str(t.get("side", "")).lower().startswith("long") else "空"
+                hold = ""
+                if t.get("hold") is not None:
+                    hold = (" · 持仓 %.1fh" % t["hold"]) if t["hold"] >= 0.1 else " · 短仓"
+                lines.append("%s %s %sx  %s USDT\n  %s → %s%s" % (
+                    t["symbol"], side_txt, t.get("lev") or "?", money(t["pnl"]),
+                    price(t.get("o")), price(t.get("c")), hold))
+            if len(fresh) > 5:
+                lines.append("…另有 %d 笔，点开看全部" % (len(fresh) - 5))
+        if pos_lines:
+            head.append("持仓变化 %d 项" % len(pos_lines))
+            if fresh:
+                lines.append("")
+            lines.extend(pos_lines[:5])
+
+        title = "%s · %s" % (name, "，".join(head))
+        priority = 4 if abs(total) >= 5000 else 3
+        tags = (["chart_with_upwards_trend"] if total >= 0
+                else ["chart_with_downwards_trend"])
+        events.append({
+            "pid": pid,
+            "name": name,
+            "topic": it.get("topic") or slug_for(pid),
+            "title": title,
+            "message": "\n".join(lines) if lines else "（详见网页）",
+            "click": "%s?pid=%s" % (SITE_URL, pid),
+            "priority": priority,
+            "tags": tags,
+            "stats": {"trades": len(fresh), "pnl": round(total, 2),
+                      "pos": len(pos_lines)},
         })
+    return events, seen_all
+
+
+# ---------------------------------------------------------------- 网页数据
+def _row_of(it):
+    """把一条采集结果转成网页列表行（与 build_web_data 同构）。"""
+    pid = it["pid"]
+    trades = it.get("recent") or []
+    return {
+        "pid": pid,
+        "slug": it.get("slug") or slug_for(pid),
+        "topic": it.get("topic") or slug_for(pid),
+        "name": it.get("name") or pid,
+        "avatar": it.get("avatar") or "",
+        "cc": it.get("cc") or 0,
+        "max_cc": it.get("max_cc") or 0,
+        "copier_pnl": it.get("copier_pnl"),
+        "sharpe": it.get("sharpe"),
+        "aum": it.get("aum"),
+        "show": bool(it.get("show")),
+        "paused": bool(it.get("paused")),
+        "status": it.get("status") or "",
+        "last_trade_at": it.get("last_trade_at") or 0,
+        "pos": _clean_positions(it.get("pos")) if it.get("show") else [],
+        "recent": trades[:20],
+        "orders": _clean_orders((it.get("orders") or {}).get("rows"))[:WEB_ORDER_LIMIT],
+        "orders_total": (it.get("orders") or {}).get("total", 0),
+        "trades": len(trades),
+        "last": trades[0]["closed"] if trades else 0,
+        "note": it.get("note") or "",
+        "enabled": it.get("enabled", True),
+    }
+
+
+def build_web_data(items, visible):
+    out = [_row_of(it) for it in items]
     return {
         "updated_at": stamp("%Y-%m-%d %H:%M:%S"),
-        "tab": tab, "sort": sort, "count": len(out), "top": top,
+        "count": len(out),
         "visible": visible,
+        "ntfy_url": NTFY_URL,
+        "site_url": SITE_URL,
         "leaders": out,
     }
+
+
+def upsert_web_row(it):
+    """把刚加的人立刻写进网页数据，用户不用等下一轮刷新。
+
+    顺序按 watchlist 排列，避免新人突兀地出现在末尾或开头。
+    """
+    with WEB_LOCK:
+        try:
+            with open(WEB_DATA_FILE, encoding="utf-8") as f:
+                doc = json.load(f)
+        except Exception:
+            doc = {"leaders": []}
+        rows = [r for r in (doc.get("leaders") or []) if str(r.get("pid")) != it["pid"]]
+        rows.append(_row_of(it))
+        order = {e["pid"]: i for i, e in enumerate(watch_entries(enabled_only=False))}
+        rows.sort(key=lambda r: order.get(str(r.get("pid")), 10 ** 6))
+        doc.update({
+            "updated_at": stamp("%Y-%m-%d %H:%M:%S"),
+            "count": len(rows),
+            "visible": sum(1 for r in rows if r.get("show")),
+            "ntfy_url": NTFY_URL,
+            "site_url": SITE_URL,
+            "leaders": rows,
+        })
+        write_web_data(doc)
+        return doc
+
+
+def drop_web_row(pid):
+    with WEB_LOCK:
+        try:
+            with open(WEB_DATA_FILE, encoding="utf-8") as f:
+                doc = json.load(f)
+        except Exception:
+            return
+        rows = [r for r in (doc.get("leaders") or []) if str(r.get("pid")) != str(pid)]
+        doc.update({
+            "updated_at": stamp("%Y-%m-%d %H:%M:%S"),
+            "count": len(rows),
+            "visible": sum(1 for r in rows if r.get("show")),
+            "leaders": rows,
+        })
+        write_web_data(doc)
+
+
+def collect_into_web(entry):
+    """后台补采一个刚加入的人，采完再更新网页数据。
+
+    单人采集要 5~8 秒，不能让 /api/add 同步等，否则用户以为页面卡死。
+    """
+    try:
+        it = _collect_one(entry, 20, 20)
+        touch_watch_meta({it["pid"]: {
+            "name": it.get("name"), "last_trade_at": it.get("last_trade_at"),
+            "show": bool(it.get("show"))}})
+        upsert_web_row(it)
+        return it
+    except Exception as exc:
+        print("  ! 后台采集 %s 失败: %s" % (entry.get("name"), exc), file=sys.stderr)
+        return None
 
 
 def build_trader_detail(pid):
@@ -383,6 +791,9 @@ def build_trader_detail(pid):
 DETAIL_CACHE = {}
 DETAIL_LOCK = threading.Lock()
 DETAIL_TTL = 60
+SEARCH_CACHE = {}
+SEARCH_TTL = 120
+WEB_LOCK = threading.Lock()          # 并发写 monitor-data.json 的互斥
 
 
 def cached_trader_detail(pid):
@@ -397,6 +808,17 @@ def cached_trader_detail(pid):
     return data
 
 
+def cached_search(q):
+    key = q.strip().lower()
+    now = time.time()
+    hit = SEARCH_CACHE.get(key)
+    if hit and now - hit[0] < SEARCH_TTL:
+        return hit[1]
+    rows = search_leaders(q)
+    SEARCH_CACHE[key] = (now, rows)
+    return rows
+
+
 def write_web_data(data):
     tmp = WEB_DATA_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -404,8 +826,158 @@ def write_web_data(data):
     os.replace(tmp, WEB_DATA_FILE)
 
 
+# ---------------------------------------------------------------- 采集
+def _collect_one(entry, hist_size, order_size):
+    """单个带单员：指标 + 平仓历史 + 订单流水 + 非零仓位。"""
+    pid = entry["pid"]
+    name = entry.get("name") or pid
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        fd = pool.submit(fetch_detail, pid)
+        fh = pool.submit(fetch_history, pid, hist_size)
+        fo = pool.submit(fetch_orders, pid, order_size)
+        try:
+            detail = fd.result() or {}
+        except Exception as exc:
+            print("  ! %s detail 失败: %s" % (name, exc), file=sys.stderr)
+            detail = {}
+        try:
+            hs = fh.result()
+        except Exception as exc:
+            print("  ! %s 平仓历史失败: %s" % (name, exc), file=sys.stderr)
+            hs = []
+        try:
+            orows, ototal = fo.result()
+        except Exception as exc:
+            print("  ! %s 订单流水失败: %s" % (name, exc), file=sys.stderr)
+            orows, ototal = [], 0
+
+    show = detail.get("positionShow") is True
+    pos = None
+    if show:
+        try:
+            pos = fetch_positions(pid)
+        except Exception:
+            pos = None
+
+    it = dict(entry)
+    it.update({
+        "name": detail.get("nickname") or entry.get("name") or pid,
+        "avatar": detail.get("avatarUrl") or entry.get("avatar") or "",
+        "cc": detail.get("currentCopyCount") or 0,
+        "max_cc": detail.get("maxCopyCount") or 0,
+        "copier_pnl": detail.get("copierPnl"),
+        "sharpe": detail.get("sharpRatio"),
+        "aum": detail.get("aumAmount"),
+        "show": show and pos is not None,
+        "paused": detail.get("isPaused") is True,
+        "status": detail.get("status") or "",
+        "last_trade_at": detail.get("lastTradeTime") or 0,
+        "pos": pos,
+        "recent": _clean_trades(hs),
+        "orders": {"rows": orows, "total": ototal},
+    })
+    return it
+
+
+def collect(hist_size=20, order_size=20, workers=4):
+    """并发采集名单里的人；单人失败只降级自己，不影响整轮。"""
+    entries = watch_entries()
+    if not entries:
+        return [], 0
+    items, visible = [], 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_collect_one, e, hist_size, order_size): e
+                   for e in entries}
+        done = {}
+        for fut in as_completed(futures):
+            entry = futures[fut]
+            try:
+                it = fut.result()
+            except Exception as exc:
+                print("  ! %s 采集失败: %s" % (entry.get("name"), exc), file=sys.stderr)
+                continue
+            done[it["pid"]] = it
+    for e in entries:                      # 保持名单顺序，不随完成先后跳动
+        it = done.get(e["pid"])
+        if it:
+            items.append(it)
+            if it.get("show"):
+                visible += 1
+    return items, visible
+
+
+def run_once(args):
+    entries = watch_entries()
+    print("名单 %d 人，开始采集…" % len(entries))
+    if not entries:
+        print("名单是空的。先搜索并添加：python3 trader_alert.py --search 昵称")
+        write_web_data(build_web_data([], 0))
+        return
+
+    items, visible = collect(args.hist_size, args.order_size, args.workers)
+    trades_total = sum(len(i.get("recent") or []) for i in items)
+    orders_total = sum(len((i.get("orders") or {}).get("rows") or []) for i in items)
+    print("采集完成: %d 人，%d 人公开持仓，%d 条平仓，%d 条订单" % (
+        len(items), visible, trades_total, orders_total))
+
+    write_web_data(build_web_data(items, visible))
+
+    meta = {i["pid"]: {"name": i.get("name"), "last_trade_at": i.get("last_trade_at"),
+                       "show": bool(i.get("show"))}
+            for i in items}
+    touch_watch_meta(meta)
+
+    state = load_state()
+    events, seen_all = build_events(items, state, args.min_pnl, preview=args.preview)
+
+    if state is None and not args.preview:
+        save_state({
+            "version": 2,
+            "created_at": stamp("%Y-%m-%d %H:%M:%S"),
+            "seen": {pid: sorted(ids)[:2000] for pid, ids in seen_all.items()},
+            "positions": {i["pid"]: i["pos"] for i in items if i.get("show")},
+        })
+        print("已建立基线（%d 人）。下一轮起只推送新增事件。" % len(seen_all))
+        print("状态文件:", STATE_FILE)
+        return
+
+    if not events:
+        print("本轮无新事件。")
+    for ev in events:
+        print("\n[%s] %s" % (ev["topic"], ev["title"]))
+        for line in ev["message"].split("\n"):
+            print("   " + line)
+
+    if args.preview:
+        print("\n这是预览，未推送、未写状态。")
+        return
+
+    for ev in events:
+        res = publish_ntfy(ev["topic"], ev["title"], ev["message"],
+                           click=ev["click"], tags=ev["tags"], priority=ev["priority"])
+        print("推送 %s -> %s" % (ev["topic"], res))
+
+    digest = "\n".join("%s：%s" % (e["name"], e["title"].split(" · ", 1)[-1])
+                       for e in events)
+    if digest:
+        for r in push_legacy("跟单监控 · %s\n%s" % (stamp(), digest)):
+            print("汇总 -> %s" % r)
+
+    merged = {}
+    for pid, ids in seen_all.items():
+        merged[pid] = sorted(set(ids) | set((state.get("seen") or {}).get(pid) or []))[:2000]
+    save_state({
+        "version": 2,
+        "created_at": state.get("created_at"),
+        "updated_at": stamp("%Y-%m-%d %H:%M:%S"),
+        "seen": merged,
+        "positions": {i["pid"]: i["pos"] for i in items if i.get("show")},
+    })
+
+
+# ---------------------------------------------------------------- 网页服务
 class WebHandler(BaseHTTPRequestHandler):
-    """只放行网页、数据与按需详情；state / 日志一律 404。"""
+    """只放行网页、数据、按需详情与名单管理；state / 日志一律 404。"""
     root = os.getcwd()
 
     def log_message(self, fmt, *a):
@@ -434,309 +1006,99 @@ class WebHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _body(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(n) if n else b""
+            return json.loads(raw.decode("utf-8")) if raw else {}
+        except Exception:
+            return {}
+
     def do_GET(self):
         u = urlparse(self.path)
-        p = u.path
-        if p in ("/", "/monitor.html"):
+        p, q = u.path, parse_qs(u.query)
+        if p in ("/", "/index.html", "/monitor.html"):
             self._send(WEB_PAGE_FILE, "text/html; charset=utf-8")
         elif p in ("/monitor-data.json", "/api/data"):
             self._send(WEB_DATA_FILE, "application/json; charset=utf-8")
         elif p == "/api/trader":
-            pid = (parse_qs(u.query).get("pid") or [""])[0]
+            pid = (q.get("pid") or [""])[0]
             if not pid.isdigit():
                 self._send_json({"error": "bad pid"}, 400)
                 return
-            try:
-                with open(os.path.join(self.root, WEB_DATA_FILE), encoding="utf-8") as f:
-                    allowed = {x["pid"] for x in json.load(f).get("leaders", [])}
-            except Exception:
-                allowed = set()
-            if pid not in allowed:
-                self._send_json({"error": "unknown pid"}, 404)
+            if not find_entry(pid):
+                self._send_json({"error": "not in watchlist"}, 404)
                 return
             try:
                 self._send_json(cached_trader_detail(pid))
             except Exception as exc:
                 self._send_json({"error": str(exc)[:120]}, 502)
+        elif p == "/api/search":
+            kw = (q.get("q") or [""])[0].strip()
+            if not kw:
+                self._send_json({"error": "empty query"}, 400)
+                return
+            try:
+                rows = cached_search(kw)
+            except Exception as exc:
+                self._send_json({"error": str(exc)[:120]}, 502)
+                return
+            watched = {e["pid"] for e in watch_entries(enabled_only=False)}
+            for r in rows:
+                r["watched"] = r["pid"] in watched
+            self._send_json({"q": kw, "count": len(rows), "list": rows})
+        elif p == "/api/watchlist":
+            self._send_json(load_watchlist())
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        u = urlparse(self.path)
+        body = self._body()
+        if u.path == "/api/add":
+            target = str(body.get("target") or body.get("pid") or "").strip()
+            if not target:
+                self._send_json({"error": "缺少 pid 或链接"}, 400)
+                return
+            try:
+                entry = add_watch(target, source="web")
+            except Exception as exc:
+                self._send_json({"error": str(exc)[:160]}, 400)
+                return
+            # 立刻返回，采集丢到后台（单人 5~8 秒，同步等会让页面像卡死）
+            threading.Thread(target=collect_into_web, args=(entry,), daemon=True).start()
+            self._send_json({"ok": True, "entry": entry, "pending": True,
+                             "reused": bool(entry.get("_reused"))})
+        elif u.path == "/api/remove":
+            pid = str(body.get("pid") or "").strip()
+            if not pid.isdigit():
+                self._send_json({"error": "bad pid"}, 400)
+                return
+            ok = remove_watch(pid)
+            if ok:
+                drop_web_row(pid)
+            self._send_json({"ok": ok})
+        elif u.path == "/api/toggle":
+            pid = str(body.get("pid") or "").strip()
+            doc = load_watchlist()
+            hit = False
+            for it in doc["items"]:
+                if str(it.get("pid")) == pid:
+                    it["enabled"] = not it.get("enabled", True)
+                    hit = True
+                    break
+            if hit:
+                save_watchlist(doc)
+            self._send_json({"ok": hit})
         else:
             self.send_error(404)
 
 
-def build_message(leaders, histories, positions, state, min_pnl, preview=False, hours=24):
-    """生成中文推送文本。preview=True 时用最近 N 小时平仓直接演示。"""
-    cutoff_ms = (time.time() - hours * 3600) * 1000
-    seen = set(state.get("seen_positions", [])) if state else set()
-    prev_lb = state.get("leaderboard", {}) if state else {}
-    prev_pos = state.get("positions", {}) if state else {}
-
-    sec_trades = []
-    for i, r in enumerate(leaders, 1):
-        pid = str(r.get("leadPortfolioId"))
-        name = r.get("nickname") or pid
-        items, dedup = [], set()
-        for h in histories.get(pid, []):
-            hid = str(h.get("positionId") or h.get("id") or "")
-            if hid in dedup:
-                continue
-            dedup.add(hid)
-            closed = h.get("closed")
-            # closed 为空 / 状态非完全平仓 => 仍在持仓，不能当平仓播报
-            if not isinstance(closed, (int, float)) or closed < 1e12:
-                continue
-            if h.get("status") not in (None, "All Closed"):
-                continue
-            is_new = preview or (hid and hid not in seen)
-            if not is_new:
-                continue
-            if preview and closed < cutoff_ms:
-                continue
-            pnl = h.get("closingPnl") or 0
-            if abs(float(pnl)) < min_pnl and not preview:
-                continue
-            hold = ""
-            opened = h.get("opened")
-            if isinstance(opened, (int, float)) and opened > 1e12:
-                hrs = (closed - opened) / 3600000
-                if hrs >= 0.1:
-                    hold = " · 持仓 %.1fh" % hrs
-                else:
-                    hold = " · 短仓"
-            side = "多" if str(h.get("side", "")).lower().startswith("long") else "空"
-            # 接口 roi 与 closingPnl 口径经常不一致，推送只报绝对盈亏
-            items.append("  %s %s %sx  %s USDT  %s\n    %s → %s%s" % (
-                h.get("symbol"), side, h.get("leverage") or "?",
-                money(pnl), fmt_ms(closed, with_date=True),
-                price(h.get("avgCost")), price(h.get("avgClosePrice")), hold,
-            ))
-        if items:
-            more = "（另有 %d 笔）" % (len(items) - 2) if len(items) > 2 else ""
-            sec_trades.append("%s（榜%d · 跟单%s）%s\n%s" % (
-                name, i, r.get("currentCopyCount"), more, "\n".join(items[:2])))
-
-    sec_pos = []
-    vis_summary = []
-    for i, r in enumerate(leaders, 1):
-        pid = str(r.get("leadPortfolioId"))
-        curr = positions.get(pid)
-        if curr is None:
-            continue                                   # 隐藏持仓，跳过
-        old = prev_pos.get(pid) or {}
-        if preview:
-            if curr:
-                vis_summary.append("%s %d 个" % (r.get("nickname"), len(curr)))
-            continue
-        if not old:
-            continue                                   # 首帧只建基线
-        evs = []
-        for key in set(list(old.keys()) + list(curr.keys())):
-            a0 = (old.get(key) or {}).get("amount", 0)
-            a1 = (curr.get(key) or {}).get("amount", 0)
-            kind = classify(a0, a1)
-            if kind:
-                evs.append("%s %s：%s → %s" % (key.split("|")[0], kind, a0, a1))
-        if evs:
-            sec_pos.append("  %s：%s" % (r.get("nickname"), "；".join(evs[:4])))
-
-    sec_lb = []
-    if state and not preview:
-        for i, r in enumerate(leaders, 1):
-            pid = str(r.get("leadPortfolioId"))
-            old = prev_lb.get(pid)
-            if not old:
-                sec_lb.append("  %s 新进 Top %d" % (r.get("nickname"), len(leaders)))
-                continue
-            name = r.get("nickname")
-            if old.get("rank", i) - i >= 3:
-                sec_lb.append("  %s 排名 %d → %d" % (name, old.get("rank"), i))
-            dcc = (r.get("currentCopyCount") or 0) - (old.get("cc") or 0)
-            if abs(dcc) >= 10:
-                sec_lb.append("  %s 跟单人数 %+d → %s" % (name, dcc, r.get("currentCopyCount")))
-            dpnl = (r.get("pnl") or 0) - (old.get("pnl") or 0)
-            if abs(dpnl) >= max(1000, abs(old.get("pnl") or 0) * 0.05):
-                sec_lb.append("  %s 30日盈亏 %+s → %s USDT" % (
-                    name, money(dpnl, 0), money(r.get("pnl"), 0)))
-            daum = (r.get("aum") or 0) - (old.get("aum") or 0)
-            if old.get("aum") and abs(daum) / abs(old["aum"]) >= 0.10:
-                sec_lb.append("  %s AUM 变动 %+.1f%%" % (name, 100 * daum / old["aum"]))
-
-    header = "跟单牛人榜 · 交易播报  %s  Top %d" % (stamp(), len(leaders))
-    if preview:
-        header += "  示例/近%d小时" % hours
-    parts = [header]
-    if sec_trades:
-        parts.append("\n新平仓\n" + "\n\n".join(sec_trades[:8]))
-    if sec_pos:
-        parts.append("\n持仓变化\n" + "\n".join(sec_pos[:5]))
-    if vis_summary:
-        parts.append("\n公开持仓 %d/%d 人：%s" % (
-            len(vis_summary), len(leaders), "、".join(vis_summary[:5])))
-    if sec_lb:
-        parts.append("\n榜单变化\n" + "\n".join(sec_lb[:8]))
-    parts.append("\n平仓记录有延迟；隐藏持仓者不报仓位。")
-    return cap_text("\n".join(parts))
-
-
-def push(text):
-    wecom = os.environ.get("WECOM_WEBHOOK")
-    tg_token = os.environ.get("TG_BOT_TOKEN")
-    tg_chat = os.environ.get("TG_CHAT_ID")
-    generic = os.environ.get("PUSH_WEBHOOK")
-    sent = []
-    if wecom:
-        try:
-            body = json.dumps({"msgtype": "markdown", "markdown": {"content": text}}).encode()
-            req = urllib.request.Request(wecom, data=body,
-                                         headers={"Content-Type": "application/json"}, method="POST")
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                sent.append("企业微信 %s" % resp.status)
-        except Exception as exc:
-            sent.append("企业微信失败: %s" % exc)
-    if tg_token and tg_chat:
-        try:
-            url = "https://api.telegram.org/bot%s/sendMessage" % tg_token
-            body = urlencode({"chat_id": tg_chat, "text": text}).encode()
-            with urllib.request.urlopen(urllib.request.Request(url, data=body), timeout=15) as resp:
-                sent.append("Telegram %s" % resp.status)
-        except Exception as exc:
-            sent.append("Telegram 失败: %s" % exc)
-    if generic:
-        try:
-            body = json.dumps({"text": text}).encode()
-            req = urllib.request.Request(generic, data=body,
-                                         headers={"Content-Type": "application/json"}, method="POST")
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                sent.append("自定义 %s" % resp.status)
-        except Exception as exc:
-            sent.append("自定义失败: %s" % exc)
-    if not sent:
-        sent.append("本地（未配置推送渠道）")
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write("\n===== %s =====\n%s\n" % (stamp("%Y-%m-%d %H:%M:%S"), text))
-    return sent
-
-
-def _collect_one(r, hist_size, order_size):
-    """单个带单员：平仓历史 + 订单流水 + 持仓可见性 + 非零仓位。"""
-    pid = str(r.get("leadPortfolioId"))
-    name = r.get("nickname") or pid
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        fh = pool.submit(fetch_history, pid, hist_size)
-        fo = pool.submit(fetch_orders, pid, order_size)
-        try:
-            hs = fh.result()
-        except Exception as exc:
-            print("  ! %s 平仓历史失败: %s" % (name, exc), file=sys.stderr)
-            hs = []
-        try:
-            orows, ototal = fo.result()
-        except Exception as exc:
-            print("  ! %s 订单流水失败: %s" % (name, exc), file=sys.stderr)
-            orows, ototal = [], 0
-    show = False
-    try:
-        show = fetch_detail(pid).get("positionShow") is True
-    except Exception:
-        pass
-    pos = None
-    if show:
-        try:
-            pos = fetch_positions(pid)
-        except Exception:
-            pos = None
-    return pid, hs, pos, show, {"rows": orows, "total": ototal}
-
-
-def collect(top, hist_size, sort="COPY_COUNT", tab="all", workers=4,
-            order_size=20):
-    """并发采集；单人失败只降级自己，不影响整轮。"""
-    leaders = fetch_leaderboard(top, sort, tab)
-    histories, positions, orders = {}, {}, {}
-    visible = 0
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_collect_one, r, hist_size, order_size) for r in leaders]
-        for fut in as_completed(futures):
-            pid, hs, pos, show, od = fut.result()
-            histories[pid] = hs
-            orders[pid] = od
-            if show:
-                visible += 1
-                positions[pid] = pos
-    return leaders, histories, positions, visible, orders
-
-
-def run_once(args):
-    leaders, histories, positions, visible, orders = collect(
-        args.top, args.hist_size, args.sort, args.tab,
-        order_size=args.order_size)
-    state = load_state()
-    print("抓取完成: %d 个带单员，%d 个可见持仓，%d 条平仓记录，%d 条订单流水" % (
-        len(leaders), visible, sum(len(v) for v in histories.values()),
-        sum(len(v["rows"]) for v in orders.values())))
-    write_web_data(build_web_data(leaders, histories, positions, visible, args.top,
-                                  args.tab, args.sort, orders=orders))
-
-    if args.preview:
-        text = build_message(leaders, histories, positions, None,
-                             args.min_pnl, preview=True, hours=args.preview_hours)
-        print("\n" + "=" * 56 + "\n" + text + "\n" + "=" * 56)
-        print("\n这是示例消息，未写入基线，也未推送。")
-        return
-
-    if state is None:
-        # 首次运行只建基线，避免把历史记录一次性刷屏
-        seen = [str(h.get("positionId") or h.get("id"))
-                for hs in histories.values() for h in hs
-                if (h.get("positionId") or h.get("id"))
-                and isinstance(h.get("closed"), (int, float))
-                and h.get("status") in (None, "All Closed")]
-        save_state({
-            "created_at": stamp("%Y-%m-%d %H:%M:%S"),
-            "seen_positions": sorted(set(seen), reverse=True)[:5000],
-            "leaderboard": {str(r["leadPortfolioId"]): {
-                "rank": i, "pnl": r.get("pnl"), "roi": r.get("roi"),
-                "cc": r.get("currentCopyCount"), "aum": r.get("aum"),
-                "mdd": r.get("mdd"),
-            } for i, r in enumerate(leaders, 1)},
-            "positions": {k: v for k, v in positions.items() if v is not None},
-        })
-        print("已建立基线（%d 条历史平仓）。下一轮起只推送新增事件。" % len(seen))
-        print("状态文件:", STATE_FILE)
-        return
-
-    text = build_message(leaders, histories, positions, state, args.min_pnl)
-    has_event = any(s in text for s in ("\n新平仓\n", "\n持仓变化\n", "\n榜单变化\n"))
-    if has_event:
-        print("\n" + text + "\n")
-        print("推送:", ", ".join(push(text)))
-    else:
-        print("本轮无新事件。")
-
-    # 更新状态
-    seen = set(state.get("seen_positions", []))
-    for hs in histories.values():
-        for h in hs:
-            hid = str(h.get("positionId") or h.get("id") or "")
-            if hid:
-                seen.add(hid)
-    save_state({
-        "created_at": state.get("created_at"),
-        "updated_at": stamp("%Y-%m-%d %H:%M:%S"),
-        "seen_positions": sorted(seen, reverse=True)[:5000],
-        "leaderboard": {str(r["leadPortfolioId"]): {
-            "rank": i, "pnl": r.get("pnl"), "roi": r.get("roi"),
-            "cc": r.get("currentCopyCount"), "aum": r.get("aum"),
-            "mdd": r.get("mdd"),
-        } for i, r in enumerate(leaders, 1)},
-        "positions": {k: v for k, v in positions.items() if v is not None},
-    })
-
-
 def serve_web(args):
-    """立刻起网页（内嵌快照可读），后台采集目录/详情并定时刷新。"""
+    """立刻起网页（内嵌快照可读），后台采集并定时刷新。"""
     interval = args.watch or 900
 
     def loop():
-        # 刚跑过 --once 时数据还新鲜，先等一个周期，避免重复抓 100 人
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), WEB_DATA_FILE)
         try:
             fresh = (time.time() - os.path.getmtime(path)) < interval
@@ -756,7 +1118,7 @@ def serve_web(args):
     WebHandler.root = os.path.dirname(os.path.abspath(__file__))
     srv = ThreadingHTTPServer((args.host, args.port), WebHandler)
     print("网页监控台: http://%s:%d" % (args.host, args.port))
-    print("每 %d 秒刷新；首轮在后台采集，期间页面显示内嵌快照。" % interval)
+    print("名单 %d 人；每 %d 秒刷新。" % (len(watch_entries()), interval))
     print("Ctrl+C 退出。")
     try:
         srv.serve_forever()
@@ -766,32 +1128,97 @@ def serve_web(args):
         srv.server_close()
 
 
+# ---------------------------------------------------------------- 命令行
+def print_search(rows, kw):
+    if not rows:
+        print("没有搜到「%s」。换个关键词，或者直接粘主页链接用 --add。")
+        return
+    watched = {e["pid"] for e in watch_entries(enabled_only=False)}
+    print("搜到 %d 个「%s」：\n" % (len(rows), kw))
+    print("%-20s %-12s %8s %14s  %s" % ("昵称", "ID 末8位", "跟单", "跟单者盈亏", "状态"))
+    for r in rows:
+        flag = "已监控" if r["pid"] in watched else ""
+        print("%-20s %-12s %8s %14s  %s" % (
+            (r["name"] or "")[:18], r["pid"][-8:],
+            r["cc"], money(r["copier_pnl"], 0), flag))
+    print("\n加入监控：python3 trader_alert.py --add <pid>")
+
+
+def cmd_list():
+    entries = watch_entries(enabled_only=False)
+    if not entries:
+        print("名单为空。用 --search 找人或 --add 加人。")
+        return
+    print("名单 %d 人（≈%s）：\n" % (len(entries), NTFY_URL))
+    print("%-20s %-12s %-6s %-6s %s" % ("昵称", "主题", "状态", "持仓", "加入时间"))
+    for e in entries:
+        print("%-20s %-12s %-6s %-6s %s" % (
+            (e.get("name") or "")[:18], e.get("topic"),
+            "监控中" if e.get("enabled", True) else "已暂停",
+            "公开" if e.get("show") else "—",
+            e.get("added_at") or ""))
+    print("\n订阅：在 ntfy 客户端添加服务器 %s，再订阅上面的主题。" % NTFY_URL)
+
+
+def cmd_test_ntfy(topic):
+    topic = topic or (watch_entries() or [{}])[0].get("topic") or "bn-test"
+    print("NTFY_URL   =", NTFY_URL)
+    print("NTFY_TOKEN =", ("已配置(%d 字符)" % len(NTFY_TOKEN)) if NTFY_TOKEN else "未配置")
+    print("topic      =", topic)
+    res = publish_ntfy(topic, "自检 · 跟单监控",
+                       "如果你看到这条，说明 Actions → ntfy → 手机 整条链路是通的。\n"
+                       "主题：%s" % topic,
+                       click=SITE_URL, tags=["white_check_mark"], priority=3)
+    print("结果:", res)
+
+
 def main():
-    ap = argparse.ArgumentParser(description="币安跟单榜牛人交易监控推送")
+    ap = argparse.ArgumentParser(description="币安跟单带单员监控（自选名单 + ntfy 订阅）")
     ap.add_argument("--once", action="store_true", help="只跑一轮")
-    ap.add_argument("--preview", action="store_true", help="生成示例消息，不建基线不推送")
-    ap.add_argument("--watch", type=int, default=0, help="循环间隔秒数，如 600")
-    ap.add_argument("--top", type=int, default=100, help="网页显示人数（默认 100）")
-    ap.add_argument("--tab", choices=["all", "recommended"], default="all",
-                    help="App 的「全部」/「推薦」tab")
-    ap.add_argument("--sort", default="COPY_COUNT",
-                    choices=["PNL", "COPY_COUNT", "ROI", "AUM", "MDD", "WIN_RATE", "COPIER_PNL"],
-                    help="榜单排序口径（默认跟单人数）")
+    ap.add_argument("--preview", action="store_true", help="打印推送内容，不发送不写状态")
+    ap.add_argument("--watch", type=int, default=0, help="循环间隔秒数，如 900")
+    ap.add_argument("--search", metavar="昵称", help="按昵称模糊搜索带单员")
+    ap.add_argument("--add", metavar="PID|URL", help="加入监控名单")
+    ap.add_argument("--remove", metavar="PID", help="移出监控名单")
+    ap.add_argument("--list", action="store_true", help="打印当前名单")
+    ap.add_argument("--test-ntfy", action="store_true", help="发一条自检消息到 ntfy")
+    ap.add_argument("--topic", help="配合 --test-ntfy 指定主题")
+    ap.add_argument("--limit", type=int, default=20, help="搜索结果条数")
     ap.add_argument("--hist-size", type=int, default=20, help="每人拉取平仓记录条数")
     ap.add_argument("--order-size", type=int, default=20,
                     help="每人拉取订单流水条数（内联到网页的取前 10 条）")
+    ap.add_argument("--workers", type=int, default=4, help="并发数")
     ap.add_argument("--min-pnl", type=float, default=0, help="平仓盈亏绝对值低于此值不推")
-    ap.add_argument("--preview-hours", type=int, default=24, help="示例消息回看小时数")
     ap.add_argument("--web", action="store_true", help="启动网页监控台")
     ap.add_argument("--host", default="127.0.0.1", help="网页监听地址")
     ap.add_argument("--port", type=int, default=8777, help="网页监听端口")
     a = ap.parse_args()
 
+    if a.search is not None:
+        print_search(search_leaders(a.search, a.limit), a.search)
+        return
+    if a.add:
+        entry = add_watch(a.add)
+        if entry.get("_reenabled"):
+            print("已在名单里（之前暂停），已恢复：%s  %s" % (entry["name"], entry["topic"]))
+        elif entry.get("_reused"):
+            print("已经在名单里：%s  %s" % (entry["name"], entry["topic"]))
+        else:
+            print("已加入：%s\n  主题: %s\n  订阅: %s/%s" % (
+                entry["name"], entry["topic"], NTFY_URL, entry["topic"]))
+        return
+    if a.remove:
+        print("已移除。" if remove_watch(a.remove) else "名单里没有这个 pid。")
+        return
+    if a.list:
+        cmd_list()
+        return
+    if a.test_ntfy:
+        cmd_test_ntfy(a.topic)
+        return
+
     if a.web:
         serve_web(a)
-        return
-    if a.preview:
-        run_once(a)
         return
     run_once(a)
     if a.watch:

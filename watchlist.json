@@ -1,0 +1,87 @@
+{
+ "updated_at": "2026-11-11 09:03:37",
+ "items": [
+  {
+   "pid": "4788776444236355328",
+   "slug": "bn-36355328",
+   "topic": "bn-36355328",
+   "name": "星辰社区-意钦",
+   "enabled": true,
+   "source": "manual",
+   "note": "",
+   "added_at": "2026-11-10 17:48",
+   "last_trade_at": 1794322098674
+  },
+  {
+   "pid": "4794150057005208320",
+   "slug": "bn-05208320",
+   "topic": "bn-05208320",
+   "name": "Btc星辰",
+   "enabled": true,
+   "source": "manual",
+   "note": "",
+   "added_at": "2026-11-10 17:48",
+   "last_trade_at": 1794182425485
+  },
+  {
+   "pid": "5283137603594326273",
+   "slug": "bn-94326273",
+   "topic": "bn-94326273",
+   "name": "黑石策略",
+   "enabled": true,
+   "source": "seed",
+   "note": "",
+   "added_at": "2026-11-10 17:52",
+   "last_trade_at": 1794358304608,
+   "show": true
+  },
+  {
+   "pid": "5291038857207319296",
+   "slug": "bn-07319296",
+   "topic": "bn-07319296",
+   "name": "Shock牙医",
+   "enabled": true,
+   "source": "seed",
+   "note": "",
+   "added_at": "2026-11-10 17:52",
+   "last_trade_at": 1794301341891,
+   "show": false
+  },
+  {
+   "pid": "4287847543651684864",
+   "slug": "bn-51684864",
+   "topic": "bn-51684864",
+   "name": "星火研究院-大象",
+   "enabled": true,
+   "source": "seed",
+   "note": "",
+   "added_at": "2026-11-10 17:52",
+   "last_trade_at": 1794325732603,
+   "show": true
+  },
+  {
+   "pid": "5251074155070629377",
+   "slug": "bn-70629377",
+   "topic": "bn-70629377",
+   "name": "BTC杰师傅",
+   "enabled": true,
+   "source": "seed",
+   "note": "",
+   "added_at": "2026-11-10 17:52",
+   "last_trade_at": 1794297698278,
+   "show": false
+  },
+  {
+   "pid": "5217752912495035905",
+   "slug": "bn-95035905",
+   "topic": "bn-95035905",
+   "name": "建斌论坛",
+   "enabled": true,
+   "source": "seed",
+   "note": "",
+   "added_at": "2026-11-10 17:52",
+   "last_trade_at": 1794356196945,
+   "show": true
+  }
+ ]
+}

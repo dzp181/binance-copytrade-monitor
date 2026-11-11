@@ -10,6 +10,16 @@ on:
         description: '只探测出口 IP 能否访问币安，不抓数据'
         type: boolean
         default: false
+      add_target:
+        description: '添加监控：带单员 ID 或主页链接（留空则不加）'
+        type: string
+        required: false
+        default: ''
+      remove_pid:
+        description: '移除监控：带单员 ID（留空则不移除）'
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -73,8 +83,25 @@ jobs:
 
       # urllib 会自动读取 HTTPS_PROXY / HTTP_PROXY，脚本无需改动。
       # state 文件由仓库持久化，因此每轮都是「增量推送」而非重建基线。
-      - name: 采集一轮（100 人 + 平仓 + 订单）
+      # 名单同样由仓库持久化（watchlist.json），采集对象 = 名单里的 enabled 项。
+      - name: 名单变更（可选）
+        if: ${{ inputs.add_target != '' || inputs.remove_pid != '' }}
+        run: |
+          if [ -n "${{ inputs.add_target }}" ]; then
+            echo "添加：${{ inputs.add_target }}"
+            python3 trader_alert.py --add "${{ inputs.add_target }}"
+          fi
+          if [ -n "${{ inputs.remove_pid }}" ]; then
+            echo "移除：${{ inputs.remove_pid }}"
+            python3 trader_alert.py --remove "${{ inputs.remove_pid }}"
+          fi
+          python3 trader_alert.py --list
+
+      - name: 采集一轮（名单内全部带单员 + 平仓 + 订单）
         env:
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          SITE_URL: ${{ vars.SITE_URL }}
           WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
@@ -82,9 +109,7 @@ jobs:
           HTTPS_PROXY: ${{ secrets.BINANCE_PROXY }}
           HTTP_PROXY: ${{ secrets.BINANCE_PROXY }}
         run: |
-          python3 trader_alert.py --once \
-            --top 100 --sort COPY_COUNT --tab all \
-            --hist-size 20 --order-size 20
+          python3 trader_alert.py --once --hist-size 20 --order-size 20
           echo "runner-ip: $(curl -sS --max-time 10 https://api.ipify.org || echo unknown)"
 
       - name: 生成自包含静态站
@@ -96,7 +121,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -f trader_alert_state.json monitor-data.json
+          git add -f trader_alert_state.json monitor-data.json watchlist.json docs
           if git diff --cached --quiet; then
             echo "数据无变化，跳过提交。"
           else

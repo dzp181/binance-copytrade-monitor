@@ -1,77 +1,83 @@
-# 币安跟单榜监控台
+# 币安跟单带单员监控台
 
-「全部」tab 前 100 人，按跟单人数降序。PC / 手机自适应，点击带单员可在顶部切换
-`仓位 / 平仓 / 交易` 三个 tab，并支持「仅公开持仓」筛选与分页。
+自选带单员 → 一人一个 ntfy 主题 → 开平仓与订单推送到手机，网页版随时看当前仓位。
 
-数据源是币安网页端未文档化的 `bapi` 公开接口，纯标准库 Python，无 cookie、无登录。
+线上只读站点：https://dzp181.github.io/binance-copytrade-monitor/
 
-## 本地运行
+## 它是什么
+
+不是「跟单榜前 100 人」，而是**你点名要盯的几个人**：
+
+- 搜昵称或粘贴带单员主页链接加入名单（`watchlist.json`）
+- 每人一个独立推送主题 `bn-<pid 后 8 位>`，订阅哪个就只收哪个
+- 每 30 分钟抓一次：当前持仓、最近平仓、最新订单
+- 一轮内同一个人的多笔平仓合并成一条通知，不刷屏
+
+## 快速开始（本机，全功能）
 
 ```bash
-python3 trader_alert.py --once                     # 抓一轮，刷新 monitor-data.json
-python3 trader_alert.py --web --watch 900         # 起网页 + 每 15 分钟刷新
-# http://127.0.0.1:8777
+python3 trader_alert.py --web --watch 900     # 网页 + 后台采集，打开 http://127.0.0.1:8777
+python3 trader_alert.py --search 星辰          # 命令行搜人
+python3 trader_alert.py --add 4788776444236355328
+python3 trader_alert.py --add "https://www.binance.com/zh-CN/copy-trading/lead-details/4794150057005208320"
+python3 trader_alert.py --list
+python3 trader_alert.py --remove 4788776444236355328
+python3 trader_alert.py --test-ntfy           # 推送自检
 ```
 
-`python3 build_static.py` 会生成完全自包含的 `docs/`，可直接双击 `docs/index.html` 或用任意静态托管打开。
+只有本机跑 `--web` 时网页才能搜人、加人。线上 Pages 是静态快照，只读。
+
+## 数据从哪来
+
+全部走币安网页端未文档化的 `bapi`，官方签名 API 查不到别人的公开组合：
+
+| 用途 | 端点 |
+| --- | --- |
+| 搜人 | `POST /bapi/futures/v1/friendly/future/copy-trade/home-page/query-list`（`nickname` 模糊匹配，必须 `useAiRecommended=false`） |
+| 组合概况 | `GET .../lead-portfolio/detail?portfolioId=` |
+| 当前持仓 | `GET .../lead-data/positions?portfolioId=` |
+| 平仓记录 | `POST .../lead-portfolio/position-history` |
+| 最新订单 | `POST .../lead-portfolio/order-history` |
+
+注意：`nickname` 搜不到纯 pid，所以粘贴链接/ID 走 `detail` 反查。这些接口没有 CORS 头，
+浏览器不能直接调，必须服务端转发——这也是线上静态站无法搜索的原因。
 
 ## GitHub Actions 定时刷新
 
-`.github/workflows/refresh.yml` 每半小时（`7,37 * * * *` UTC）跑一轮，产出快照、
-推送增量事件、回写 state，并部署 GitHub Pages。
+`.github/workflows/refresh.yml`，cron `7,37 * * * *` UTC：
 
-线上地址：https://dzp181.github.io/binance-copytrade-monitor/
+1. `probe` 先验出口能不能访问币安（2026-11-09 实测 Azure westus3 返回 200，未被 451 拦）
+2. 读 `watchlist.json` 采集 → 回写 state / 快照 / 名单
+3. `build_static.py` 生成 `docs/` → Pages 发布
 
-需要先在 Settings → Pages 把 Build and deployment 的 Source 设为 **GitHub Actions**
-（GITHUB_TOKEN 无权自动创建 Pages site，只能手动开一次）。
+手动加人：Actions → 币安跟单榜刷新 → Run workflow → 填 `add_target`（ID 或链接）/ `remove_pid`。
 
-想只验证出口而不抓数据：
+首次部署要手动开一次 Pages（Settings → Pages → Source = GitHub Actions），
+`GITHUB_TOKEN` 无权自动创建 Pages site。
 
-```
-Actions -> 币安跟单榜刷新 -> Run workflow -> probe_only = true
-```
+## 需要配的 Secrets
 
-### 关于 451：实测结论
+| 名称 | 用途 |
+| --- | --- |
+| `NTFY_URL` | 自建 ntfy 地址，如 `http://1.2.3.4:8858` |
+| `NTFY_TOKEN` | 只授权 `bn-*` 前缀的发布 token（服务端 `auth-default-access: deny-all`，匿名发布返回 403） |
+| `SITE_URL` | 静态站地址，拼进通知的点击链接（也可配成仓库 Variable） |
+| `BINANCE_PROXY` | 可选，出口被拦时才需要 |
 
-网上常见的结论是「GitHub 托管 runner 是美国 Azure IP，币安一律 451」，
-但那主要针对 `fapi.binance.com` / `api.binance.com` 这类交易 API。
-**2026-11-09 实测**：Azure westus3 出口（`4.249.19.21`）请求跟单榜的
-`www.binance.com/bapi/.../home-page/query-list` 返回 `HTTP 200`、
-`code=000000`、`total=12980`；完整一轮 100 人（含 1586 条平仓、1707 条订单）
-约 14 秒采完，比本机还快。所以**默认托管 runner 可用，不需要代理**。
+不配 `NTFY_TOKEN` 也能跑，只是不推送，只更新网页。
 
-workflow 仍保留 `probe` job 作为保险：哪天币安收紧策略或触发限流，
-3 秒内失败，不让 100 人采集白跑。届时三种备用方案：
+## 目录
 
-| 方案 | 做法 | 代价 |
-| --- | --- | --- |
-| 代理出口（首选） | 仓库 Secrets 加 `BINANCE_PROXY=http://user:pass@host:port` | 需要一个非受限地区的 HTTP 代理；`urllib` 会自动读取 `HTTPS_PROXY`，脚本零改动 |
-| 自建 runner | 把两个 job 的 `runs-on` 改成 `self-hosted`，跑在非美区 VPS 或本机 | 要维护一台常开的机器 |
-| 不用 Actions | 本机 `launchd` 定时跑 `--once`，只把 `docs/` 推到 Pages | 电脑要常开，但没有出口限制问题 |
+| 文件 | 作用 |
+| --- | --- |
+| `trader_alert.py` | 采集 + 聚合 + ntfy 推送 + 本地网页服务（`/api/data`、`/api/search`、`/api/add`、`/api/trader`） |
+| `watchlist.json` | 监控名单，唯一数据源，随仓库持久化 |
+| `monitor.html` | 响应式单页，PC 双栏 / 手机单列，数据来自内联快照或 `/api/data` |
+| `build_static.py` | 把快照与详情内联成纯静态站，不改 `monitor.html` 源文件 |
+| `docs/` | 生成的静态站（Pages 根目录） |
 
-`BINANCE_PROXY` 必须是 HTTP/HTTPS 代理（SOCKS5 原生 `urllib` 不支持）。
-配好后重跑 `probe_only=true`，看到 `HTTP=200` 即恢复正常。
+## 已知限制
 
-### Secrets（按需，全部可选）
-
-`WECOM_WEBHOOK` / `TG_BOT_TOKEN` + `TG_CHAT_ID` / `PUSH_WEBHOOK` —— 推送渠道。
-不配则事件只写日志。`BINANCE_PROXY` —— 见上。
-
-### 为什么 state 要提交回仓库
-
-`trader_alert_state.json` 记录 `seen_positions`，用来只推「新增平仓」。Actions 每次
-都是干净 runner，不持久化 state 的话每轮都会当成首次运行去建基线，永远不推送。
-自动 commit 带 `[skip ci]`，也顺带避免 public 仓库 60 天无活动被停掉 schedule。
-
-## 数据口径与延迟
-
-- 榜单：`全部` tab + `30D` + `COPY_COUNT` 降序 + `hideFull=False`，前 100 人。
-- ROI / PNL 每小时更新，Sharpe 12 小时，榜单本身慢变化。
-- 订单流水延迟约 4 分钟，平仓记录数分钟到约 1 小时。**这是播报，不是成交信号。**
-- 无公开 WebSocket 事件流，别把 cron 调到 5 分钟——不会更快，只会增加被风控概率。
-- 定时任务在高峰期可能延迟 15–60 分钟，别依赖精确分钟。
-
-## 额度
-
-public 仓库的标准托管 runner 免费且不限分钟；private 仓库每月 2,000 分钟，
-一轮约 5 分钟，半小时一次会超。本仓库建议保持 public（数据本身全是公开信息）。
+- 指标有延迟：ROI、PNL 约每小时更新，订单历史约 4 分钟，平仓数分钟到 1 小时，不能当成交信号
+- 隐藏持仓的带单员抓不到仓位（`positionShow=false`）
+- Pages 是静态站，线上不能加人；加人在本机或 Actions
