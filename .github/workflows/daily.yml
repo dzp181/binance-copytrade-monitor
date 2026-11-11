@@ -63,5 +63,7 @@ jobs:
             echo "备份无变化，跳过提交。"
           else
             git commit -m "chore: backup $(date -u +'%Y-%m-%d') [skip ci]"
+            # 半小时一轮的 refresh 也会提交，先变基再推，避免被挡
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
             git push
           fi
