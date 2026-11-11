@@ -20,6 +20,10 @@ on:
         type: string
         required: false
         default: ''
+      ntfy_test:
+        description: '只发一条 ntfy 自检消息，验证 runner -> 服务器推送链路'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -96,6 +100,13 @@ jobs:
             python3 trader_alert.py --remove "${{ inputs.remove_pid }}"
           fi
           python3 trader_alert.py --list
+
+      - name: ntfy 链路自检
+        if: ${{ inputs.ntfy_test == true }}
+        env:
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+        run: python3 trader_alert.py --test-ntfy --topic bn-36355328
 
       - name: 采集一轮（名单内全部带单员 + 平仓 + 订单）
         env:
