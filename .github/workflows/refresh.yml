@@ -11,8 +11,11 @@ name: 币安跟单榜刷新
 
 on:
   schedule:
-    # 每半小时一次，避开整点（GitHub 整点排队最严重）
-    - cron: '7,37 * * * *'
+    # 每 5 分钟一次，避开整点（GitHub 整点排队最严重）。
+    # 注意：GitHub 对 public 仓库的高频 schedule 会大幅降频甚至丢弃，
+    # 这里的 cron 只是兜底，真正的节拍由服务器 112.74.95.74 的
+    # crontab 主动 workflow_dispatch 驱动（见 README「定时触发」）。
+    - cron: '2,7,12,17,22,27,32,37,42,47,52,57 * * * *'
   workflow_dispatch:
     inputs:
       probe_only:

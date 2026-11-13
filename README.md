@@ -22,7 +22,7 @@ Actions: pull 名单 -> trader_alert.py --once -> POST 快照回应用 -> 提交
 网页:    读应用里的快照 -> 列表 + 详情三 tab（仓位 / 平仓 / 交易）
 ```
 
-- 每 30 分钟：`.github/workflows/refresh.yml`（cron `7,37 * * * *`）
+- 每 5 分钟：`.github/workflows/refresh.yml`（cron `2,7,12,...,57`，仅兜底；实际节拍由服务器 cron 驱动）
 - 每天 03:17 UTC：重建全量带单员索引（约 1.3 万人），供网页昵称搜索
 - 每天 04:07 UTC：把应用的 `data.db` 拉回仓库 `backups/`，留 14 天
 
@@ -54,7 +54,7 @@ Actions: pull 名单 -> trader_alert.py --once -> POST 快照回应用 -> 提交
 
 ## 定时触发（重要）
 
-`refresh.yml` 里写了 `cron: '7,37 * * * *'`（每 30 分钟），但 **GitHub 对 public
+`refresh.yml` 里写了每 5 分钟的 cron，但 **GitHub 对 public
 仓库的高频 schedule 会降频甚至直接丢弃**。2026-11-09 ~ 11-11 两天实测只触发 5 次，
 间隔 5~8 小时，网页数据一停就是半天；`daily.yml` 的 schedule 更是一次都没跑过。
 
@@ -69,9 +69,9 @@ Actions: pull 名单 -> trader_alert.py --once -> POST 快照回应用 -> 提交
 crontab 三条（服务器时区是 CST，即北京时间）：
 
 ```
-7,37 * * * * /home/zhangsan/bn-refresh.sh              # 每 30 分钟采集
+2-59/5 * * * * /home/zhangsan/bn-refresh.sh           # 每 5 分钟采集（:02 :07 … :57）
 17 11 * * *  /home/zhangsan/bn-refresh.sh daily.yml     # 11:17 重建搜索索引
-7 12 * * *   /home/zhangsan/bn-refresh.sh daily.yml     # 12:07 拉数据库备份
+9 12 * * *   /home/zhangsan/bn-refresh.sh daily.yml     # 12:09 拉数据库备份（避开 :07 的采集）
 ```
 
 GitHub 那边原来的 cron 保留当兜底，两边撞上也无害 —— `concurrency`
@@ -88,14 +88,34 @@ ssh zhangsan@112.74.95.74 "tail -5 /home/zhangsan/bn-refresh.log"
 ssh zhangsan@112.74.95.74 "crontab -l | grep bn-refresh"
 ```
 
-页面顶部会显示「X 分钟前更新」，超过 45 分钟变橙、90 分钟变红，一眼能看出断没断。
+页面顶部会显示「X 分钟前更新」，超过 15 分钟变橙、30 分钟变红，一眼能看出断没断（5 分钟一轮，漏 3 轮就算异常）。
+
+### 为什么是 5 分钟，不是更短
+
+币安自己就有延迟下限：订单历史约 4 分钟、平仓记录几分钟到 1 小时、ROI/累计盈亏
+按小时结算。5 分钟已经卡在订单延迟的下限上，**再快也拿不到更新的数据**，只会
+把 Actions 运行次数和仓库 commit 数成倍放大。
+
+改频率要连带改的三处，漏一处就会看到「数据是新的、页面还说 10 分钟前」：
+
+| 位置 | 现值 |
+| --- | --- |
+| 服务器 crontab | `2-59/5`（:02 :07 … :57，避开整点排队） |
+| `refresh.yml` 的 cron | `2,7,12,...,57`（兜底，GitHub 可能降频） |
+| 页面轮询（`index.html`） | 60 秒拉一次 `loadState()` |
+| 新鲜度阈值 | 15 分钟橙、30 分钟红 |
+
+代价：每轮都会 `git commit` 一次 `trader_alert_state.json`（差分的基准，不提交
+下一轮就变成「首次运行」，会重复推送），所以每天会增加约 288 个 commit。
+这不会产生费用（public 仓库的 Actions 免费且不计分钟），但 `git log` 会变吵。
+
 
 ## 权限与限制
 
 - 第一个注册的账号自动是管理员；之后注册的都是普通用户，由管理员在「管理 → 用户」里提权。
 - 每人每天最多提交 3 个、待审最多 5 个，防止刷单。
 - 推送按人按轮聚合：一轮里同一人多笔平仓合成一条，不刷屏。
-- 新增一个带单员：提交后是 `pending`，**不采集**；管理员在「待审」通过后，还要等下一轮（≤30 分钟）才会出数据。审核接口本身不触发采集，因为沙箱出不了网。
+- 新增一个带单员：提交后是 `pending`，**不采集**；管理员在「待审」通过后，还要等下一轮（≤5 分钟）才会出数据。审核接口本身不触发采集，因为沙箱出不了网。
 - 采集延迟：订单历史约 4 分钟，平仓数分钟到 1 小时，ROI/PNL 每小时更新。**这不是成交信号**。
 
 ## 备份与恢复
