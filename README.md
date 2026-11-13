@@ -22,7 +22,7 @@ Actions: pull 名单 -> trader_alert.py --once -> POST 快照回应用 -> 提交
 网页:    读应用里的快照 -> 列表 + 详情三 tab（仓位 / 平仓 / 交易）
 ```
 
-- 每 5 分钟：`.github/workflows/refresh.yml`（cron `2,7,12,...,57`，仅兜底；实际节拍由服务器 cron 驱动）
+- 每 5 分钟：`.github/workflows/refresh.yml`（只留 `23 * * * *` 作每小时兜底；实际节拍由服务器 cron 驱动）
 - 每天 03:17 UTC：重建全量带单员索引（约 1.3 万人），供网页昵称搜索
 - 每天 04:07 UTC：把应用的 `data.db` 拉回仓库 `backups/`，留 14 天
 
@@ -54,7 +54,7 @@ Actions: pull 名单 -> trader_alert.py --once -> POST 快照回应用 -> 提交
 
 ## 定时触发（重要）
 
-`refresh.yml` 里写了每 5 分钟的 cron，但 **GitHub 对 public
+`refresh.yml` 里的 cron 只做兜底，因为 **GitHub 对 public
 仓库的高频 schedule 会降频甚至直接丢弃**。2026-11-09 ~ 11-11 两天实测只触发 5 次，
 间隔 5~8 小时，网页数据一停就是半天；`daily.yml` 的 schedule 更是一次都没跑过。
 
@@ -101,7 +101,7 @@ ssh zhangsan@112.74.95.74 "crontab -l | grep bn-refresh"
 | 位置 | 现值 |
 | --- | --- |
 | 服务器 crontab | `2-59/5`（:02 :07 … :57，避开整点排队） |
-| `refresh.yml` 的 cron | `2,7,12,...,57`（兜底，GitHub 可能降频） |
+| `refresh.yml` 的 cron | `23 * * * *`（每小时兜底；写成每 5 分钟会和服务器 dispatch 撞车） |
 | 页面轮询（`index.html`） | 60 秒拉一次 `loadState()` |
 | 新鲜度阈值 | 15 分钟橙、30 分钟红 |
 
