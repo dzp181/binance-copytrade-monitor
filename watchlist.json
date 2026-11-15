@@ -1,5 +1,5 @@
 {
- "updated_at": "2026-11-15 11:22:25",
+ "updated_at": "2026-11-15 11:27:20",
  "items": [
   {
    "pid": "4788776444236355328",
@@ -9,7 +9,7 @@
    "enabled": true,
    "source": "app",
    "note": "",
-   "added_at": "2026-11-15 03:22",
+   "added_at": "2026-11-15 03:27",
    "last_trade_at": 1794648160758
   },
   {
@@ -20,7 +20,7 @@
    "enabled": true,
    "source": "app",
    "note": "",
-   "added_at": "2026-11-15 03:22",
+   "added_at": "2026-11-15 03:27",
    "last_trade_at": 1794698851603
   },
   {
@@ -31,9 +31,7 @@
    "enabled": true,
    "source": "app",
    "note": "",
-   "added_at": "2026-11-15 03:22",
-   "last_trade_at": 1794694118796,
-   "show": true
+   "added_at": "2026-11-15 03:27"
   },
   {
    "pid": "5291038857207319296",
@@ -43,7 +41,7 @@
    "enabled": true,
    "source": "app",
    "note": "",
-   "added_at": "2026-11-15 03:22"
+   "added_at": "2026-11-15 03:27"
   },
   {
    "pid": "4287847543651684864",
@@ -53,7 +51,7 @@
    "enabled": true,
    "source": "app",
    "note": "",
-   "added_at": "2026-11-15 03:22",
+   "added_at": "2026-11-15 03:27",
    "last_trade_at": 1794711610772,
    "show": true
   },
@@ -65,7 +63,7 @@
    "enabled": true,
    "source": "app",
    "note": "",
-   "added_at": "2026-11-15 03:22"
+   "added_at": "2026-11-15 03:27"
   },
   {
    "pid": "5217752912495035905",
@@ -75,9 +73,7 @@
    "enabled": true,
    "source": "app",
    "note": "",
-   "added_at": "2026-11-15 03:22",
-   "last_trade_at": 1794704908998,
-   "show": true
+   "added_at": "2026-11-15 03:27"
   },
   {
    "pid": "5081524986903087872",
@@ -87,7 +83,7 @@
    "enabled": true,
    "source": "app",
    "note": "",
-   "added_at": "2026-11-15 03:22",
+   "added_at": "2026-11-15 03:27",
    "last_trade_at": 1794689674890,
    "show": true
   },
@@ -99,7 +95,7 @@
    "enabled": true,
    "source": "app",
    "note": "",
-   "added_at": "2026-11-15 03:22",
+   "added_at": "2026-11-15 03:27",
    "last_trade_at": 1794698502178
   }
  ]
